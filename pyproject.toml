@@ -85,7 +85,7 @@ requires-python = ">=3.10"
 dependencies = [
   "base2048>=0.1.3",
   "transformers>=4.51.3,<4.57.0",
-  "datasets>=3.0.0,<4.0",
+  "datasets>=3.0.0,<=4.0",
   "colorama>=0.4.3",
   "tqdm>=4.67.1",
   "cohere>=5.16.0",
@@ -99,13 +99,14 @@ dependencies = [
   "accelerate>=0.23.0",
   "avidtools==0.1.2",
   "stdlibs>=2022.10.9",
-  "langchain>=0.3.25,<1.0.0",
+  "langchain>=1.0.0",
   "nemollm>=0.3.0",
   "cmd2==2.4.3",
   "torch>=2.6.0",
   "sentencepiece>=0.1.99",
   "markdown>=3.4.3",
-  "numpy>=2.0.0",
+  'numpy>=1.26,<2; python_version < "3.12"',
+  'numpy>=2.0.0; python_version >= "3.12"',
   "zalgolib>=0.2.2",
   "ecoji>=0.1.1",
   "deepl==1.17.0",
@@ -153,6 +154,10 @@ audio = [
 ]
 dra = [
   "detoxify>=0.5.0"
+]
+
+agent = [
+  'nvidia-nat[adk]==1.3.1; python_version >= "3.11" and python_version < "3.14"'
 ]
 [project.urls]
 "Homepage" = "https://github.com/NVIDIA/garak"

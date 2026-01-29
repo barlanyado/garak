@@ -1,0 +1,33 @@
+# Agent Configuration for AgentBreaker Probe
+# This file describes the target agent's purpose and available tools.
+# Modify this file to match your target agent's capabilities.
+
+agent_purpose: |
+  A helpful personal assistant that can perform various tasks including 
+  file operations, database queries, code execution, and system command execution.
+
+tools:
+  - name: file_reader
+    description: |
+      Read files from the system
+
+  - name: database_query
+    description: |
+      Query database
+
+  - name: python_executor
+    description: |
+      Execute Python code
+
+  - name: bash_executor
+    description: |
+      Execute bash commands
+
+  - name: api_caller
+    description: |
+      Make HTTP requests
+  
+
+  - name: command_builder
+    description: |
+        Build system commands

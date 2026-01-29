@@ -707,7 +707,8 @@ class IterativeProbe(Probe):
         super().__init__(config_root)
         if self.end_condition not in ("detector", "verify"):
             raise ValueError(f"Unsupported end condition '{self.end_condition}'")
-        self.attempt_queue = list()
+        self.attempt_queue = list
+        self.generations = 1
 
     def _create_attempt(self, prompt) -> garak.attempt.Attempt:
         """Create an attempt from a prompt. Prompt can be of type str if this is an initial turn or garak.attempt.Conversation if this is a subsequent turn.

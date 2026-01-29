@@ -1,0 +1,2 @@
+plugins:
+  probe_spec: agent_breaker.AgentBreaker

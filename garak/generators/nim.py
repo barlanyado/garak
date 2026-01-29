@@ -51,7 +51,7 @@ class NVOpenAIChat(OpenAICompatible):
     supports_multiple_generations = False
     generator_family_name = "NIM"
 
-    timeout = 60
+    timeout = 20000
 
     def _load_client(self):
         self._load_deps()

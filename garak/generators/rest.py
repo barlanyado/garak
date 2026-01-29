@@ -40,7 +40,7 @@ class RestGenerator(Generator):
         "response_json": False,
         "response_json_field": None,
         "req_template": "$INPUT",
-        "request_timeout": 20,
+        "request_timeout": 200,
         "proxies": None,
         "verify_ssl": True,
     }
@@ -286,7 +286,7 @@ class RestGenerator(Generator):
             if isinstance(response_object, list):
                 response = [item[self.response_json_field] for item in response_object]
             else:
-                response = [response_object[self.response_json_field]]
+                response = [response_object["choices"][0]["message"]["content"]]
         else:
             field_path_expr = jsonpath_ng.parse(self.response_json_field)
             responses = field_path_expr.find(response_object)

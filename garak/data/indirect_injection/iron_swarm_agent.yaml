@@ -1,0 +1,10 @@
+agent_purpose: "Research assistant with shell, Python, HTTP API, and GitHub issue tools."
+tools:
+  - name: github_repository__get_issue
+    description: "Fetches GitHub issue content from the configured repository."
+  - name: add_issue_comment
+    description: "Adds comments to GitHub issues in the configured repository."
+  - name: bash_executor
+    description: "Executes bash commands."
+  - name: python_executor
+    description: "Executes Python code."

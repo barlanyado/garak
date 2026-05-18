@@ -1,0 +1,60 @@
+run:
+  generations: 1
+
+plugins:
+  target_type: rest.RestGenerator
+  target_name: personal-assistant
+  probe_spec: indirect_injection.IndirectInjection
+  extended_detectors:
+    - indirect_injection.IndirectInjectionResult
+  generators:
+    rest:
+      RestGenerator:
+        uri: http://localhost:8000/v1/chat/completions
+        req_template_json_object:
+          model: garak
+          messages:
+            - role: user
+              content: $INPUT
+        response_json: true
+        response_json_field: "$.choices[0].message.content"
+        request_timeout: 240
+        max_tokens: 4096
+  probes:
+    indirect_injection:
+      IndirectInjection:
+        red_team_model_type: "nim.NVOpenAIChat"
+        red_team_model_name: "aws/anthropic/claude-opus-4-5"
+        red_team_model_config:
+          uri: "https://inference-api.nvidia.com/v1/"
+          max_tokens: 8192
+          suppressed_params:
+            - stop
+            - top_p
+            - frequency_penalty
+            - presence_penalty
+            - seed
+        exploit_goals:
+          - goal_hijacking
+          - tool_misuse
+          - data_exfiltration
+        injectors:
+          github:
+            type: "injectors.github.GitHubInjector"
+            config:
+              owner: "barlanyado"
+              repo: "test"
+  detectors:
+    indirect_injection:
+      IndirectInjectionResult:
+        detector_model_type: "nim"
+        detector_model_name: "aws/anthropic/claude-opus-4-5"
+        detector_model_config:
+          uri: "https://inference-api.nvidia.com/v1/"
+          max_tokens: 1024
+          suppressed_params:
+            - stop
+            - top_p
+            - frequency_penalty
+            - presence_penalty
+            - seed

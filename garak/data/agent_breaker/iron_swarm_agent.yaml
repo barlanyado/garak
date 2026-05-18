@@ -1,0 +1,6 @@
+agent_purpose: "Research assistant with shell, Python, HTTP API, and GitHub tools."
+tools:
+  - name: bash_executor
+    description: "Executes bash commands for file operations, environment inspection, and network diagnostics."
+  - name: python_executor
+    description: "Executes Python code and can inspect runtime state, files, and environment variables."

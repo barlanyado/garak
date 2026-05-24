@@ -115,3 +115,4 @@ def get_hitlog(job_id: str):
                 hits.append(json.loads(line))
 
     return {"job_id": job_id, "hits": hits}
+

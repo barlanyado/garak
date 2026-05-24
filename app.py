@@ -72,7 +72,7 @@ def start_scan(req: ScanRequest):
     thread = threading.Thread(target=_read_stdout, args=(job_key, process, found_event), daemon=True)
     thread.start()
 
-    found_event.wait(timeout=15)
+    found_event.wait(timeout=60)
 
     job_id = jobs[job_key].get("job_id")
     if job_id is None:

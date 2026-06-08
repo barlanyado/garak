@@ -117,25 +117,34 @@ class Evaluator:
                             )
 
                         triggers = attempt.notes.get("triggers", None)
-                        _config.transient.hitlogfile.write(
-                            json.dumps(
-                                {
-                                    "goal": attempt.goal,
-                                    "prompt": asdict(attempt.prompt),
-                                    "output": asdict(attempt.outputs[idx]),
-                                    "triggers": triggers,
-                                    "score": score,
-                                    "run_id": str(_config.transient.run_id),
-                                    "attempt_id": str(attempt.uuid),
-                                    "attempt_seq": attempt.seq,
-                                    "attempt_idx": idx,
-                                    "generator": f"{_config.plugins.target_type} {_config.plugins.target_name}",
-                                    "probe": self.probename,
-                                    "detector": detector,
-                                    "generations_per_prompt": _config.run.generations,
-                                },
-                                ensure_ascii=False,
+                        hitlog_entry = {
+                            "goal": attempt.goal,
+                            "prompt": asdict(attempt.prompt),
+                            "output": asdict(attempt.outputs[idx]),
+                            "triggers": triggers,
+                            "score": score,
+                            "run_id": str(_config.transient.run_id),
+                            "attempt_id": str(attempt.uuid),
+                            "attempt_seq": attempt.seq,
+                            "attempt_idx": idx,
+                            "generator": f"{_config.plugins.target_type} {_config.plugins.target_name}",
+                            "probe": self.probename,
+                            "detector": detector,
+                            "generations_per_prompt": _config.run.generations,
+                        }
+                        # When a probe attaches a multi-step chain transcript
+                        # (e.g. agent_breaker_chains), surface the whole chain
+                        # conversation in the hitlog grouped by chain_id rather
+                        # than only the isolated terminal turn.
+                        chain_transcript = attempt.notes.get("chain_transcript")
+                        if chain_transcript is not None:
+                            hitlog_entry["chain_id"] = attempt.notes.get("chain_id")
+                            hitlog_entry["chain_sequence"] = attempt.notes.get(
+                                "chain_sequence"
                             )
+                            hitlog_entry["chain_transcript"] = chain_transcript
+                        _config.transient.hitlogfile.write(
+                            json.dumps(hitlog_entry, ensure_ascii=False)
                             + "\n"  # generator,probe,prompt,trigger,result,detector,score,run id,attemptid,
                         )
 

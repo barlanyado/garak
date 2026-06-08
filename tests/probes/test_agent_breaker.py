@@ -15,7 +15,10 @@ from unittest.mock import MagicMock, patch, call
 import garak._plugins
 import garak.attempt
 from garak.attempt import Attempt, Message
-from garak.probes.agent_breaker import AgentBreaker, AttackState
+from garak.probes.agent_breaker import (
+    AgentBreaker,
+    AttackState,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +227,270 @@ class TestDiscoverAgentConfig:
 
 
 # ===========================================================================
+# _perform_behavioral_probe
+# ===========================================================================
+
+
+class TestPerformBehavioralProbe:
+    """The behavioral baseline phase calls each tool with benign inputs and
+    captures real outputs / errors / refusals so ANALYSIS is grounded in
+    observed target behavior, not the agent's self-description."""
+
+    def _generator_returning(self, *texts):
+        gen = MagicMock()
+        responses = []
+        for t in texts:
+            r = MagicMock()
+            r.text = t
+            responses.append([r])
+        gen.generate.side_effect = responses
+        return gen
+
+    def test_returns_empty_when_no_tools(self):
+        probe = _make_probe(agent_config={"agent_purpose": "P", "tools": []})
+        generator = MagicMock()
+        result = probe._perform_behavioral_probe(generator)
+        assert result == {}
+        generator.generate.assert_not_called()
+
+    def test_captures_observation_per_probe(self):
+        """Happy path: red team generates 2 probes, both succeed, both parse."""
+        probe = _make_probe(behavioral_probe_calls_per_tool=2)
+        probe.agent_config["tools"] = [
+            {"name": "file_reader", "description": "Reads files"},
+        ]
+        # Two agent responses for two probe calls.
+        generator = self._generator_returning(
+            "contents of /tmp/sample.txt: hello",
+            "contents of /var/log/app.log: started ok",
+        )
+
+        # _get_model_response is called: 1x probe-gen, 2x parse.
+        probe._get_model_response = MagicMock(
+            side_effect=[
+                json.dumps(
+                    {
+                        "probes": [
+                            "Please read /tmp/sample.txt",
+                            "Please read /var/log/app.log",
+                        ]
+                    }
+                ),
+                json.dumps(
+                    {
+                        "outcome": "success",
+                        "output_shape": "string contents",
+                        "output_sample": "hello",
+                        "error_signature": "",
+                        "refusal_signature": "",
+                        "observed_constraints": [],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "outcome": "success",
+                        "output_shape": "string contents",
+                        "output_sample": "started ok",
+                        "error_signature": "",
+                        "refusal_signature": "",
+                        "observed_constraints": [],
+                    }
+                ),
+            ]
+        )
+
+        result = probe._perform_behavioral_probe(generator)
+        assert list(result.keys()) == ["file_reader"]
+        observations = result["file_reader"]
+        assert len(observations) == 2
+        assert observations[0]["outcome"] == "success"
+        assert observations[0]["probe_prompt"] == "Please read /tmp/sample.txt"
+        assert observations[1]["output_sample"] == "started ok"
+        assert generator.generate.call_count == 2
+
+    def test_empty_probes_list_skips_tool(self):
+        """If red team returns no probes (destructive-only tool), skip it."""
+        probe = _make_probe()
+        probe.agent_config["tools"] = [
+            {"name": "transfer_money", "description": "Transfers money"},
+        ]
+        generator = MagicMock()
+        probe._get_model_response = MagicMock(
+            return_value=json.dumps({"probes": []})
+        )
+
+        result = probe._perform_behavioral_probe(generator)
+        assert result == {}
+        generator.generate.assert_not_called()
+
+    def test_generator_exception_skips_probe_but_continues(self):
+        """A probe-call exception must not prevent other tools from being probed."""
+        probe = _make_probe(behavioral_probe_calls_per_tool=1)
+        probe.agent_config["tools"] = [
+            {"name": "tool_a", "description": "A"},
+            {"name": "tool_b", "description": "B"},
+        ]
+
+        good_resp = MagicMock()
+        good_resp.text = "tool_b output"
+        generator = MagicMock()
+        generator.generate.side_effect = [
+            RuntimeError("boom"),  # tool_a probe call fails
+            [good_resp],  # tool_b probe call succeeds
+        ]
+
+        probe._get_model_response = MagicMock(
+            side_effect=[
+                # probe-gen for tool_a
+                json.dumps({"probes": ["probe a"]}),
+                # probe-gen for tool_b
+                json.dumps({"probes": ["probe b"]}),
+                # parse for tool_b
+                json.dumps(
+                    {
+                        "outcome": "success",
+                        "output_shape": "string",
+                        "output_sample": "tool_b output",
+                        "error_signature": "",
+                        "refusal_signature": "",
+                        "observed_constraints": [],
+                    }
+                ),
+            ]
+        )
+
+        result = probe._perform_behavioral_probe(generator)
+        # tool_a swallowed; tool_b captured
+        assert "tool_a" not in result
+        assert "tool_b" in result
+        assert len(result["tool_b"]) == 1
+
+    def test_invalid_probe_gen_json_skips_tool(self):
+        probe = _make_probe()
+        probe.agent_config["tools"] = [
+            {"name": "tool_x", "description": "X"},
+        ]
+        generator = MagicMock()
+        probe._get_model_response = MagicMock(return_value="NOT JSON {{{")
+
+        result = probe._perform_behavioral_probe(generator)
+        assert result == {}
+        generator.generate.assert_not_called()
+
+    def test_empty_response_from_agent_skipped(self):
+        """If the target returns empty text for a probe, that probe is dropped
+        but the tool still gets attempted for any other probes."""
+        probe = _make_probe(behavioral_probe_calls_per_tool=2)
+        probe.agent_config["tools"] = [
+            {"name": "tool_x", "description": "X"},
+        ]
+        empty_resp = MagicMock()
+        empty_resp.text = None
+        good_resp = MagicMock()
+        good_resp.text = "real output"
+        generator = MagicMock()
+        generator.generate.side_effect = [[empty_resp], [good_resp]]
+
+        probe._get_model_response = MagicMock(
+            side_effect=[
+                json.dumps({"probes": ["probe 1", "probe 2"]}),
+                json.dumps(
+                    {
+                        "outcome": "success",
+                        "output_shape": "string",
+                        "output_sample": "real output",
+                        "error_signature": "",
+                        "refusal_signature": "",
+                        "observed_constraints": [],
+                    }
+                ),
+            ]
+        )
+
+        result = probe._perform_behavioral_probe(generator)
+        assert len(result["tool_x"]) == 1
+        assert result["tool_x"][0]["output_sample"] == "real output"
+
+    def test_zero_calls_per_tool_returns_empty(self):
+        probe = _make_probe(behavioral_probe_calls_per_tool=0)
+        probe.agent_config["tools"] = [
+            {"name": "tool_x", "description": "X"},
+        ]
+        generator = MagicMock()
+        result = probe._perform_behavioral_probe(generator)
+        assert result == {}
+        generator.generate.assert_not_called()
+
+
+# ===========================================================================
+# _format_tools_for_analysis with behaviors
+# ===========================================================================
+
+
+class TestFormatToolsForAnalysisWithBehaviors:
+
+    def test_behavior_block_rendered_when_present(self):
+        probe = _make_probe()
+        probe.agent_config["tools"] = [
+            {"name": "file_reader", "description": "Reads files"},
+        ]
+        behaviors = {
+            "file_reader": [
+                {
+                    "probe_prompt": "Read /tmp/x",
+                    "outcome": "refusal",
+                    "output_shape": "",
+                    "output_sample": "",
+                    "error_signature": "",
+                    "refusal_signature": "I will not read /tmp",
+                    "observed_constraints": ["blocks /tmp/* reads"],
+                }
+            ]
+        }
+        out = probe._format_tools_for_analysis(
+            tool_profiles={}, tool_behaviors=behaviors
+        )
+        assert "Observed behavior" in out
+        assert "I will not read /tmp" in out
+        assert "blocks /tmp/* reads" in out
+
+    def test_behavior_block_omitted_when_absent(self):
+        probe = _make_probe()
+        probe.agent_config["tools"] = [
+            {"name": "file_reader", "description": "Reads files"},
+        ]
+        out = probe._format_tools_for_analysis(tool_profiles={}, tool_behaviors={})
+        assert "Observed behavior" not in out
+
+    def test_behavior_block_omitted_for_tools_without_observations(self):
+        probe = _make_probe()
+        probe.agent_config["tools"] = [
+            {"name": "tool_a", "description": "A"},
+            {"name": "tool_b", "description": "B"},
+        ]
+        behaviors = {
+            "tool_a": [
+                {
+                    "outcome": "success",
+                    "output_shape": "json",
+                    "output_sample": "{\"ok\": true}",
+                    "error_signature": "",
+                    "refusal_signature": "",
+                    "observed_constraints": [],
+                }
+            ]
+        }
+        out = probe._format_tools_for_analysis(
+            tool_profiles={}, tool_behaviors=behaviors
+        )
+        # Tool A renders its block; Tool B has its header but no behavior block.
+        assert "Tool: tool_a" in out
+        assert "Tool: tool_b" in out
+        # Only one "Observed behavior" header — for tool_a.
+        assert out.count("Observed behavior") == 1
+
+
+# ===========================================================================
 # probe() orchestration
 # ===========================================================================
 
@@ -248,6 +515,53 @@ class TestProbeOrchestration:
         ):
             probe._create_init_attempts()
             mock_discover.assert_not_called()
+
+    def test_behavioral_probe_disabled_skips_phase(self):
+        """behavioral_probe_enabled=False must skip the phase entirely."""
+        probe = _make_probe(behavioral_probe_enabled=False)
+        probe.generator = MagicMock()
+        with (
+            patch.object(probe, "_setup_red_team_model"),
+            patch.object(probe, "_perform_deep_recon", return_value={}),
+            patch.object(probe, "_perform_behavioral_probe") as mock_probe,
+            patch.object(
+                probe,
+                "_analyze_attackable_tools",
+                return_value={
+                    "tool_analyses": {"file_reader": {"attack_prompts": ["x"]}},
+                    "priority_targets": [],
+                },
+            ),
+            patch.object(probe, "_attack_single_tool", return_value=[]),
+        ):
+            probe._create_init_attempts()
+        mock_probe.assert_not_called()
+        assert probe.tool_behaviors == {}
+
+    def test_behavioral_probe_enabled_runs_phase(self):
+        """When enabled, _perform_behavioral_probe runs and stores observations."""
+        probe = _make_probe(behavioral_probe_enabled=True)
+        probe.generator = MagicMock()
+        observations = {"file_reader": [{"outcome": "success"}]}
+        with (
+            patch.object(probe, "_setup_red_team_model"),
+            patch.object(probe, "_perform_deep_recon", return_value={}),
+            patch.object(
+                probe, "_perform_behavioral_probe", return_value=observations
+            ) as mock_probe,
+            patch.object(
+                probe,
+                "_analyze_attackable_tools",
+                return_value={
+                    "tool_analyses": {"file_reader": {"attack_prompts": ["x"]}},
+                    "priority_targets": [],
+                },
+            ),
+            patch.object(probe, "_attack_single_tool", return_value=[]),
+        ):
+            probe._create_init_attempts()
+        mock_probe.assert_called_once_with(probe.generator)
+        assert probe.tool_behaviors == observations
 
     def test_returns_empty_when_no_tools(self):
         probe = _make_probe(agent_config={"agent_purpose": "", "tools": []})

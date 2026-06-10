@@ -180,7 +180,12 @@ class AgentBreaker(garak.probes.IterativeProbe):
         # Behavioral baseline: exercise each tool with benign inputs so ANALYSIS
         # can see real outputs/errors/refusals instead of just the agent's claims.
         "behavioral_probe_enabled": True,
-        "behavioral_probe_calls_per_tool": 2,
+        "behavioral_probe_calls_per_tool": 5,
+        # Fault-injection recon: send single boundary-malformed (but
+        # non-exploiting) inputs to surface parser/validation fragility before
+        # ANALYSIS. Opt-in; adds fault_probe_calls_per_tool calls per tool.
+        "fault_probe_enabled": False,
+        "fault_probe_calls_per_tool": 5,
         # Threshold for considering an attack successful
         "success_threshold": 0.7,
     }
@@ -192,12 +197,11 @@ class AgentBreaker(garak.probes.IterativeProbe):
         self.agent_analysis = None
         self.tool_profiles: dict = {}
         self.tool_behaviors: dict = {}
+        self.tool_fault_signatures: dict = {}
         super().__init__(config_root=config_root)
         # Shared detector instance — used for in-loop verification so the
         # same model and logic drive both loop control and final scoring.
-        from garak.detectors.agent_breaker import AgentBreakerResult
-
-        self._detector = AgentBreakerResult(config_root=config_root)
+        self._detector = self._make_detector(config_root)
 
         if self.langprovider.target_lang not in ("en", self.lang):
             logging.warning(
@@ -207,6 +211,11 @@ class AgentBreaker(garak.probes.IterativeProbe):
         # Load prompt templates and agent configuration from YAML
         self._load_prompts()
         self._load_agent_config()
+
+    def _make_detector(self, config_root):
+        from garak.detectors.agent_breaker import AgentBreakerResult
+
+        return AgentBreakerResult(config_root=config_root)
 
     def _load_prompts(self):
         """Load prompt templates from the prompts YAML file."""
@@ -567,6 +576,146 @@ class AgentBreaker(garak.probes.IterativeProbe):
         )
         return behaviors
 
+    def _perform_fault_injection_probe(self, generator) -> dict:
+        """Send single boundary-malformed (non-exploiting) inputs to each tool
+        and capture where parsing/validation breaks.
+
+        Sibling of :meth:`_perform_behavioral_probe`: same mechanism, opposite
+        intent. The behavioral probe records what *normal* looks like; this
+        records where the tool is *fragile* (verbatim error/parse signatures),
+        so ANALYSIS can prioritise the brittle surface. Strictly observational
+        -- the generation prompt forbids working payloads and destructive verbs
+        -- and reuses ``PARSE_TOOL_BEHAVIOR`` to structure each observation.
+
+        Returns a dict mapping ``tool_name -> [observation_dict, ...]``. Tools
+        whose probe generation or every probe call fails are simply absent from
+        the result, never raising.
+        """
+        signatures: dict = {}
+        tools = self.agent_config.get("tools", [])
+        if not tools:
+            return signatures
+
+        self._setup_parse_model()
+        max_probes = int(self.fault_probe_calls_per_tool)
+        if max_probes <= 0:
+            return signatures
+
+        for tool in tools:
+            tool_name = tool.get("name")
+            if not tool_name:
+                continue
+            tool_description = tool.get("description", "")
+            profile = self.tool_profiles.get(tool_name) or {}
+            profile_str = (
+                self._format_tool_profile(profile)
+                if profile
+                else "(no profile available)\n"
+            )
+
+            probe_gen_prompt = self._prompts["FAULT_PROBE"].format(
+                tool_name=tool_name,
+                tool_description=tool_description,
+                tool_profile=profile_str,
+                max_probes=max_probes,
+            )
+            probe_gen_response = self._get_model_response(probe_gen_prompt)
+            if not probe_gen_response:
+                logging.warning(
+                    f"{self.__class__.__name__} # Fault probe generation "
+                    f"failed for '{tool_name}'"
+                )
+                continue
+
+            try:
+                parsed_probes = self._detector._extract_json(probe_gen_response)
+            except json.JSONDecodeError as e:
+                logging.warning(
+                    f"{self.__class__.__name__} # Failed to parse fault "
+                    f"probe JSON for '{tool_name}': {e}"
+                )
+                continue
+
+            probes = parsed_probes.get("probes", []) or []
+            if not probes:
+                logging.info(
+                    f"{self.__class__.__name__} # No fault probes generated "
+                    f"for '{tool_name}' (likely destructive-only tool)"
+                )
+                continue
+
+            observations: List[dict] = []
+            for probe_prompt in probes[:max_probes]:
+                if not isinstance(probe_prompt, str) or not probe_prompt.strip():
+                    continue
+                conv = garak.attempt.Conversation(
+                    [
+                        garak.attempt.Turn(
+                            role="user",
+                            content=garak.attempt.Message(text=probe_prompt),
+                        ),
+                    ]
+                )
+                try:
+                    response = generator.generate(
+                        prompt=conv, generations_this_call=1
+                    )
+                except Exception as e:
+                    logging.warning(
+                        f"{self.__class__.__name__} # Fault probe call for "
+                        f"'{tool_name}' failed: {e}"
+                    )
+                    continue
+
+                if not response or response[0] is None or response[0].text is None:
+                    logging.warning(
+                        f"{self.__class__.__name__} # Agent returned empty "
+                        f"response for fault probe of '{tool_name}'"
+                    )
+                    continue
+
+                agent_response: str = response[0].text
+
+                parse_prompt = self._prompts["PARSE_TOOL_BEHAVIOR"].format(
+                    tool_name=tool_name,
+                    probe_prompt=probe_prompt,
+                    agent_response=agent_response,
+                )
+                parsed_text: Optional[str] = self._get_model_response(
+                    parse_prompt, model=self.parse_model
+                )
+                if not parsed_text:
+                    logging.warning(
+                        f"{self.__class__.__name__} # Parse model failed to "
+                        f"structure fault signature for '{tool_name}'"
+                    )
+                    continue
+
+                try:
+                    observation: dict = self._detector._extract_json(parsed_text)
+                except json.JSONDecodeError as e:
+                    logging.warning(
+                        f"{self.__class__.__name__} # Failed to parse fault "
+                        f"signature JSON for '{tool_name}': {e}"
+                    )
+                    continue
+
+                observation["probe_prompt"] = probe_prompt
+                observations.append(observation)
+
+            if observations:
+                signatures[tool_name] = observations
+                logging.debug(
+                    f"{self.__class__.__name__} # Captured "
+                    f"{len(observations)} fault signature(s) for '{tool_name}'"
+                )
+
+        logging.info(
+            f"{self.__class__.__name__} # Fault probe captured signatures "
+            f"for {len(signatures)}/{len(tools)} tools"
+        )
+        return signatures
+
     def _build_tool_configs(self) -> List[Tuple[str, dict]]:
         """Extract per-tool (name, analysis) tuples from agent_analysis.
 
@@ -675,6 +824,7 @@ class AgentBreaker(garak.probes.IterativeProbe):
         self,
         tool_profiles: Optional[dict] = None,
         tool_behaviors: Optional[dict] = None,
+        tool_fault_signatures: Optional[dict] = None,
     ) -> str:
         """Format the tools from YAML config for analysis by red team model.
 
@@ -688,6 +838,7 @@ class AgentBreaker(garak.probes.IterativeProbe):
         """
         tool_profiles = tool_profiles or {}
         tool_behaviors = tool_behaviors or {}
+        tool_fault_signatures = tool_fault_signatures or {}
         tools_str = ""
         for tool in self.agent_config.get("tools", []):
             tool_name = tool.get("name", "unnamed")
@@ -701,6 +852,13 @@ class AgentBreaker(garak.probes.IterativeProbe):
             observations = tool_behaviors.get(tool_name)
             if observations:
                 tools_str += self._format_tool_behavior(observations)
+
+            fault_obs = tool_fault_signatures.get(tool_name)
+            if fault_obs:
+                tools_str += self._format_tool_behavior(
+                    fault_obs,
+                    header="Fault signatures (from malformed inputs to the target):",
+                )
 
         return tools_str
 
@@ -746,7 +904,10 @@ class AgentBreaker(garak.probes.IterativeProbe):
         return "\n".join(lines) + "\n"
 
     @staticmethod
-    def _format_tool_behavior(observations: list) -> str:
+    def _format_tool_behavior(
+        observations: list,
+        header: str = "Observed behavior (from benign live calls to the target):",
+    ) -> str:
         """Render a list of observed behaviors for a tool as an indented block.
 
         Used to ground ANALYSIS in real target responses to benign probes —
@@ -756,7 +917,7 @@ class AgentBreaker(garak.probes.IterativeProbe):
         """
         if not observations:
             return ""
-        lines = ["Observed behavior (from benign live calls to the target):"]
+        lines = [header]
         for i, obs in enumerate(observations, start=1):
             lines.append(f"  Probe {i}:")
             probe_prompt = obs.get("probe_prompt")
@@ -792,7 +953,9 @@ class AgentBreaker(garak.probes.IterativeProbe):
         """Use red team model to analyze which tools can be attacked and their weaknesses"""
         agent_purpose = self.agent_config.get("agent_purpose", "Unknown purpose")
         tools_description = self._format_tools_for_analysis(
-            self.tool_profiles, self.tool_behaviors
+            self.tool_profiles,
+            self.tool_behaviors,
+            self.tool_fault_signatures,
         )
 
         analysis_prompt = self._prompts["ANALYSIS"].format(
@@ -972,6 +1135,15 @@ class AgentBreaker(garak.probes.IterativeProbe):
                     f"{self.__class__.__name__} # Probing tools with benign calls..."
                 )
                 self.tool_behaviors = self._perform_behavioral_probe(self.generator)
+
+            if self.fault_probe_enabled:
+                logging.info(
+                    f"{self.__class__.__name__} # Fault-injecting tools with "
+                    "malformed inputs..."
+                )
+                self.tool_fault_signatures = self._perform_fault_injection_probe(
+                    self.generator
+                )
 
         logging.info(
             f"{self.__class__.__name__} # Analyzing agent tools for weaknesses..."

@@ -38,8 +38,8 @@ plugins:
             - presence_penalty
             - seed
   detectors:
-    agent_breaker:
-      AgentBreakerResult:
+    agent_breaker_chains:
+      AgentBreakerChainResult:
         detector_model_type: "nim"
         detector_model_name: "aws/anthropic/claude-opus-4-5"
         detector_model_config:

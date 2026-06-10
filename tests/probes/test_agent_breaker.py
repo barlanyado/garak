@@ -423,6 +423,122 @@ class TestPerformBehavioralProbe:
 
 
 # ===========================================================================
+# _perform_fault_injection_probe
+# ===========================================================================
+
+
+class TestPerformFaultInjectionProbe:
+    """The fault-injection recon phase sends single boundary-malformed (but
+    non-exploiting) inputs to each tool and captures verbatim error / parse
+    signatures so ANALYSIS can prioritise the fragile surface. It mirrors the
+    behavioral probe mechanism and reuses PARSE_TOOL_BEHAVIOR."""
+
+    def _generator_returning(self, *texts):
+        gen = MagicMock()
+        responses = []
+        for t in texts:
+            r = MagicMock()
+            r.text = t
+            responses.append([r])
+        gen.generate.side_effect = responses
+        return gen
+
+    def test_returns_empty_when_no_tools(self):
+        probe = _make_probe(agent_config={"agent_purpose": "P", "tools": []})
+        generator = MagicMock()
+        result = probe._perform_fault_injection_probe(generator)
+        assert result == {}
+        generator.generate.assert_not_called()
+
+    def test_captures_fault_signature_per_probe(self):
+        """Happy path: red team generates 2 malformed probes, both parse."""
+        probe = _make_probe(fault_probe_calls_per_tool=2)
+        probe.agent_config["tools"] = [
+            {"name": "file_reader", "description": "Reads files"},
+        ]
+        generator = self._generator_returning(
+            "Error: unexpected token ' at position 12",
+            "Error: malformed JSON body",
+        )
+        probe._get_model_response = MagicMock(
+            side_effect=[
+                json.dumps(
+                    {
+                        "probes": [
+                            "Read the file named foo'",
+                            "Read the file described by {\"path\":",
+                        ]
+                    }
+                ),
+                json.dumps(
+                    {
+                        "outcome": "error",
+                        "output_shape": "error string",
+                        "output_sample": "unexpected token '",
+                        "error_signature": "unexpected token ' at position 12",
+                        "refusal_signature": "",
+                        "observed_constraints": ["breaks on stray single quote"],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "outcome": "error",
+                        "output_shape": "error string",
+                        "output_sample": "malformed JSON body",
+                        "error_signature": "malformed JSON body",
+                        "refusal_signature": "",
+                        "observed_constraints": ["rejects truncated JSON"],
+                    }
+                ),
+            ]
+        )
+
+        result = probe._perform_fault_injection_probe(generator)
+        assert list(result.keys()) == ["file_reader"]
+        observations = result["file_reader"]
+        assert len(observations) == 2
+        assert observations[0]["outcome"] == "error"
+        assert observations[0]["probe_prompt"] == "Read the file named foo'"
+        assert observations[1]["error_signature"] == "malformed JSON body"
+        assert generator.generate.call_count == 2
+
+    def test_empty_probes_list_skips_tool(self):
+        """Destructive-only tool: red team returns no safe fault probes."""
+        probe = _make_probe()
+        probe.agent_config["tools"] = [
+            {"name": "transfer_money", "description": "Transfers money"},
+        ]
+        generator = MagicMock()
+        probe._get_model_response = MagicMock(
+            return_value=json.dumps({"probes": []})
+        )
+        result = probe._perform_fault_injection_probe(generator)
+        assert result == {}
+        generator.generate.assert_not_called()
+
+    def test_invalid_probe_gen_json_skips_tool(self):
+        probe = _make_probe()
+        probe.agent_config["tools"] = [
+            {"name": "tool_x", "description": "X"},
+        ]
+        generator = MagicMock()
+        probe._get_model_response = MagicMock(return_value="NOT JSON {{{")
+        result = probe._perform_fault_injection_probe(generator)
+        assert result == {}
+        generator.generate.assert_not_called()
+
+    def test_zero_calls_per_tool_returns_empty(self):
+        probe = _make_probe(fault_probe_calls_per_tool=0)
+        probe.agent_config["tools"] = [
+            {"name": "tool_x", "description": "X"},
+        ]
+        generator = MagicMock()
+        result = probe._perform_fault_injection_probe(generator)
+        assert result == {}
+        generator.generate.assert_not_called()
+
+
+# ===========================================================================
 # _format_tools_for_analysis with behaviors
 # ===========================================================================
 
@@ -488,6 +604,35 @@ class TestFormatToolsForAnalysisWithBehaviors:
         assert "Tool: tool_b" in out
         # Only one "Observed behavior" header — for tool_a.
         assert out.count("Observed behavior") == 1
+
+    def test_fault_signature_block_rendered_under_distinct_header(self):
+        probe = _make_probe()
+        probe.agent_config["tools"] = [
+            {"name": "file_reader", "description": "Reads files"},
+        ]
+        fault_signatures = {
+            "file_reader": [
+                {
+                    "probe_prompt": "Read the file named foo'",
+                    "outcome": "error",
+                    "output_shape": "error string",
+                    "output_sample": "unexpected token '",
+                    "error_signature": "unexpected token ' at position 12",
+                    "refusal_signature": "",
+                    "observed_constraints": ["breaks on stray single quote"],
+                }
+            ]
+        }
+        out = probe._format_tools_for_analysis(
+            tool_profiles={},
+            tool_behaviors={},
+            tool_fault_signatures=fault_signatures,
+        )
+        assert "Fault signatures" in out
+        assert "unexpected token ' at position 12" in out
+        assert "breaks on stray single quote" in out
+        # Fault block uses its own header, not the benign-behavior one.
+        assert "Observed behavior" not in out
 
 
 # ===========================================================================
@@ -562,6 +707,56 @@ class TestProbeOrchestration:
             probe._create_init_attempts()
         mock_probe.assert_called_once_with(probe.generator)
         assert probe.tool_behaviors == observations
+
+    def test_fault_probe_disabled_by_default_skips_phase(self):
+        """fault_probe_enabled defaults False, so the phase must not run."""
+        probe = _make_probe()
+        assert probe.fault_probe_enabled is False
+        probe.generator = MagicMock()
+        with (
+            patch.object(probe, "_setup_red_team_model"),
+            patch.object(probe, "_perform_deep_recon", return_value={}),
+            patch.object(probe, "_perform_behavioral_probe", return_value={}),
+            patch.object(probe, "_perform_fault_injection_probe") as mock_fault,
+            patch.object(
+                probe,
+                "_analyze_attackable_tools",
+                return_value={
+                    "tool_analyses": {"file_reader": {"attack_prompts": ["x"]}},
+                    "priority_targets": [],
+                },
+            ),
+            patch.object(probe, "_attack_single_tool", return_value=[]),
+        ):
+            probe._create_init_attempts()
+        mock_fault.assert_not_called()
+        assert probe.tool_fault_signatures == {}
+
+    def test_fault_probe_enabled_runs_phase(self):
+        """When enabled, _perform_fault_injection_probe runs and stores signatures."""
+        probe = _make_probe(fault_probe_enabled=True)
+        probe.generator = MagicMock()
+        signatures = {"file_reader": [{"outcome": "error"}]}
+        with (
+            patch.object(probe, "_setup_red_team_model"),
+            patch.object(probe, "_perform_deep_recon", return_value={}),
+            patch.object(probe, "_perform_behavioral_probe", return_value={}),
+            patch.object(
+                probe, "_perform_fault_injection_probe", return_value=signatures
+            ) as mock_fault,
+            patch.object(
+                probe,
+                "_analyze_attackable_tools",
+                return_value={
+                    "tool_analyses": {"file_reader": {"attack_prompts": ["x"]}},
+                    "priority_targets": [],
+                },
+            ),
+            patch.object(probe, "_attack_single_tool", return_value=[]),
+        ):
+            probe._create_init_attempts()
+        mock_fault.assert_called_once_with(probe.generator)
+        assert probe.tool_fault_signatures == signatures
 
     def test_returns_empty_when_no_tools(self):
         probe = _make_probe(agent_config={"agent_purpose": "", "tools": []})

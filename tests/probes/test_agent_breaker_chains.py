@@ -1216,6 +1216,51 @@ class TestStepPromptFormatting:
         out = probe._generate_step_exploit_prompt(self._chain(), 1, history=[])
         assert out == "refined"
 
+    def test_global_artifacts_flow_into_step_prompt(self):
+        """Artifacts discovered by other chains (run-wide store) must appear in
+        a step's rendered prompt so lookup chains can reuse known-valid ids."""
+        probe = _make_probe()
+        probe.global_artifacts = {"employee_id": "E-01"}
+        captured = {}
+
+        def _capture(prompt, *a, **k):
+            captured["prompt"] = prompt
+            return json.dumps({"attack_prompt": "p"})
+
+        probe._get_model_response = MagicMock(side_effect=_capture)
+        probe._generate_step_attack_prompt(self._chain(), 0)
+        assert "employee_id = E-01" in captured["prompt"]
+
+    def test_chain_local_artifacts_override_global(self):
+        probe = _make_probe()
+        probe.global_artifacts = {"employee_id": "E-99"}
+        chain = self._chain()
+        chain["artifacts"] = {"employee_id": "E-01"}
+        captured = {}
+
+        def _capture(prompt, *a, **k):
+            captured["prompt"] = prompt
+            return json.dumps({"attack_prompt": "p"})
+
+        probe._get_model_response = MagicMock(side_effect=_capture)
+        probe._generate_step_attack_prompt(chain, 0)
+        assert "employee_id = E-01" in captured["prompt"]
+        assert "E-99" not in captured["prompt"]
+
+    def test_last_agent_feedback_surfaces_recent_error(self):
+        probe = _make_probe()
+        probe.global_artifacts = {}
+        captured = {}
+
+        def _capture(prompt, *a, **k):
+            captured["prompt"] = prompt
+            return json.dumps({"attack_prompt": "p"})
+
+        probe._get_model_response = MagicMock(side_effect=_capture)
+        history = [{"response": "500 Internal Server Error; provide an employee id"}]
+        probe._generate_step_exploit_prompt(self._chain(), 0, history=history)
+        assert "provide an employee id" in captured["prompt"]
+
 
 # ===========================================================================
 # AgentBreakerChainResult detector — role-aware scoring
@@ -1290,6 +1335,26 @@ class TestAgentBreakerChainResult:
         det = self._detector()
         chain = self._chain(["upload", "exec"], ["plant", "exploit"], step_index=0)
         attempt = self._attempt(chain, verified_results=[(True, 0.95)])
+        scores = det.detect(attempt)
+        assert scores == [0.0]
+
+    def test_recon_incidental_finding_scores_like_exploit(self):
+        """A recon step flagged as an incidental finding (e.g. it dumped the
+        whole salary table) must be scored as a hit, not hard-zeroed."""
+        det = self._detector()
+        chain = self._chain(["get_org_chart", "update_record"], ["recon", "exploit"], step_index=0)
+        attempt = self._attempt(chain, verified_results=[(True, 0.9)])
+        attempt.notes["incidental_finding"] = True
+        attempt.notes["incidental_reason"] = "recon dumped all salaries"
+        scores = det.detect(attempt)
+        assert scores == [1.0]
+
+    def test_recon_incidental_finding_below_cutoff_scores_zero(self):
+        """Incidental path still honours the confidence cutoff."""
+        det = self._detector()
+        chain = self._chain(["get_org_chart", "update_record"], ["recon", "exploit"], step_index=0)
+        attempt = self._attempt(chain, verified_results=[(True, 0.5)])
+        attempt.notes["incidental_finding"] = True
         scores = det.detect(attempt)
         assert scores == [0.0]
 

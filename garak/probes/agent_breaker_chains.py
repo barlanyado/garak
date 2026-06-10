@@ -28,7 +28,10 @@ import json
 import logging
 from typing import Iterable, List, Optional, Tuple
 
+import yaml
+
 from garak import _config
+from garak.data import path as data_path
 import garak.attempt
 from garak.probes.agent_breaker import AgentBreaker, AttackState
 
@@ -39,18 +42,18 @@ class AgentBreakerChains(AgentBreaker):
     Discovers and attacks multi-tool chains using a capability-graph path
     search:
 
-    1. :meth:`_tag_tool_capabilities` — tag every tool with what it
+    1. _tag_tool_capabilities — tag every tool with what it
        consumes/produces, its capability class, and source/sink markers.
-    2. :meth:`_build_capability_graph` — pure-Python candidate edges where one
+    2. _build_capability_graph — pure-Python candidate edges where one
        tool's output tag feeds another tool's input tag.
-    3. :meth:`_score_edges` — one batched LLM call to confirm/score edges.
-    4. :meth:`_search_chains` — pure-Python bounded source->sink path search,
+    3. _score_edges — one batched LLM call to confirm/score edges.
+    4. _search_chains — pure-Python bounded source->sink path search,
        ranked by ``sink_severity * product(edge_confidence)``.
-    5. :meth:`_generate_chain_attacks` — write conversational payloads for each
+    5. _generate_chain_attacks — write conversational payloads for each
        concrete path.
 
     Recon, deep recon, and per-tool weakness analysis are inherited from
-    :class:`AgentBreaker` (the per-tool analysis grounds capability tagging).
+    class AgentBreaker (the per-tool analysis grounds capability tagging).
     Running this probe drives the target independently, so it re-runs recon
     rather than sharing it with a single-tool run.
     """
@@ -86,6 +89,23 @@ class AgentBreakerChains(AgentBreaker):
         # call. Read immediately after generation to stamp the attack state, so
         # per-step history records which technique class each attempt used.
         self._last_step_technique: str = ""
+        # Artifacts accumulated across ALL chains during the run. One chain's
+        # recon (e.g. an org chart that returns every employee id) populates
+        # this so a different chain's recon can reuse those concrete values
+        # instead of cold-calling a tool that 500s on under-specified input.
+        # Read at prompt-render time, written whenever any step extracts.
+        self.global_artifacts: dict = {}
+
+    def _make_detector(self, config_root):
+        from garak.detectors.agent_breaker_chains import AgentBreakerChainResult
+
+        return AgentBreakerChainResult(config_root=config_root)
+
+    def _load_prompts(self):
+        super()._load_prompts()
+        chains_prompts_path = data_path / "agent_breaker_chains" / "prompts.yaml"
+        with open(chains_prompts_path, "r", encoding="utf-8") as f:
+            self._prompts.update(yaml.safe_load(f))
 
     # ------------------------------------------------------------------
     # Orchestration
@@ -141,7 +161,7 @@ class AgentBreakerChains(AgentBreaker):
     def _build_chain_configs(self) -> List[Tuple[str, dict]]:
         """Extract (entry_tool, chain_dict) tuples from agent_analysis.
 
-        Mirrors :meth:`AgentBreaker._build_tool_configs` but for chain attacks.
+        Mirrors `AgentBreaker._build_tool_configs` but for chain attacks.
         Each ``chain_dict`` carries an ``is_chain`` flag so the refinement code
         path can branch on it; the entry tool is used as ``current_target`` so
         existing detector/verify code keeps working unchanged.
@@ -224,14 +244,14 @@ class AgentBreakerChains(AgentBreaker):
 
         Pipeline (each LLM step is a small, reliable sub-task):
 
-        1. :meth:`_tag_tool_capabilities` — tag every tool with what it
+        1. `_tag_tool_capabilities` — tag every tool with what it
            consumes/produces, its capability class, and source/sink markers.
-        2. :meth:`_build_capability_graph` — pure-Python candidate edges where
+        2. `_build_capability_graph` — pure-Python candidate edges where
            one tool's output tag feeds another tool's input tag.
-        3. :meth:`_score_edges` — one batched LLM call to confirm/score edges.
-        4. :meth:`_search_chains` — pure-Python bounded source->sink path search,
+        3. `_score_edges` — one batched LLM call to confirm/score edges.
+        4. `_search_chains` — pure-Python bounded source->sink path search,
            ranked by ``sink_severity * product(edge_confidence)``.
-        5. :meth:`_generate_chain_attacks` — write conversational payloads for
+        5. `_generate_chain_attacks` — write conversational payloads for
            each concrete path.
 
         Returns a dict with ``chains`` and ``priority_chains`` keys (the same
@@ -569,7 +589,7 @@ class AgentBreakerChains(AgentBreaker):
 
         Each discovered path is expanded into up to
         ``max_hypotheses_per_chain`` independent attack lines, one per DISTINCT
-        exploit technique (see :meth:`_generate_exploit_hypotheses`). This is the
+        exploit technique (see `_generate_exploit_hypotheses`). This is the
         fix for fixation: rather than committing the whole chain to a single
         exploit idea, the probe explores several (e.g. path traversal vs.
         planting executable content) as separate, separately-tunable chains.
@@ -953,6 +973,24 @@ class AgentBreakerChains(AgentBreaker):
             return "(none labeled yet)"
         return ", ".join(f"{t} (x{counts[t]})" for t in order)
 
+    def _last_agent_feedback(self, history: list) -> str:
+        """Surface the most recent agent response for the refiner to adapt to.
+
+        Buried inside ``history_str`` the latest response is easy for the model
+        to skim past. Hoisting it (truncated) into its own field makes errors
+        and parameter hints actionable -- e.g. a tool 500 or the agent asking
+        for an employee id/email instead of a name, which is exactly the signal
+        that a recon step should switch its lookup key rather than resend the
+        same failing query.
+        """
+        if not history:
+            return "(no prior response yet)"
+        last = history[-1] or {}
+        response = (last.get("response") or "").strip()
+        if not response:
+            return "(prior attempt produced no usable response)"
+        return response[: self._STEP_RESPONSE_CHAR_LIMIT]
+
     def _extract_attack_prompt(self, response: Optional[str]) -> Optional[str]:
         """Pull ``attack_prompt`` from a JSON LLM response, with raw fallback.
 
@@ -1011,7 +1049,9 @@ class AgentBreakerChains(AgentBreaker):
         target_tool = sequence[step_index]
         entry = self._plan_entry(chain, step_index)
         prior_outputs = chain.get("step_outputs", []) or []
-        artifacts = chain.get("artifacts", {}) or {}
+        # Chain-local artifacts take precedence, but fall back to anything any
+        # other chain has already discovered this run (e.g. valid employee ids).
+        artifacts = {**self.global_artifacts, **(chain.get("artifacts", {}) or {})}
         hypothesis = chain.get("hypothesis", {}) or {}
 
         prompt = self._prompts["STEP_ATTACK"].format(
@@ -1043,7 +1083,7 @@ class AgentBreakerChains(AgentBreaker):
     ) -> Optional[str]:
         """Refine the current step's prompt given prior failed attempts.
 
-        Same plan-entry inputs as :meth:`_generate_step_attack_prompt`, plus
+        Same plan-entry inputs as `_generate_step_attack_prompt`, plus
         the per-step ``history`` rendered as a transcript so the red-team
         model can analyze refusal/error patterns specific to this step.
         """
@@ -1053,7 +1093,7 @@ class AgentBreakerChains(AgentBreaker):
         target_tool = sequence[step_index]
         entry = self._plan_entry(chain, step_index)
         prior_outputs = chain.get("step_outputs", []) or []
-        artifacts = chain.get("artifacts", {}) or {}
+        artifacts = {**self.global_artifacts, **(chain.get("artifacts", {}) or {})}
         hypothesis = chain.get("hypothesis", {}) or {}
 
         prompt = self._prompts["STEP_EXPLOIT"].format(
@@ -1075,6 +1115,7 @@ class AgentBreakerChains(AgentBreaker):
             prior_steps_transcript=self._format_prior_steps(prior_outputs),
             vulnerabilities=chain.get("vulnerabilities", "Unknown vulnerabilities"),
             tried_techniques=self._tried_techniques(history),
+            last_response=self._last_agent_feedback(history),
             history_str=self._format_step_history(history),
         )
         return self._extract_attack_prompt(self._get_model_response(prompt))
@@ -1267,7 +1308,7 @@ class AgentBreakerChains(AgentBreaker):
         below ``max_step_attempts``, otherwise abandon the chain.
 
         Per-step history is the entire ``state.attempts_history`` because
-        history is reset whenever a step advances (in :meth:`_queue_step_attack`).
+        history is reset whenever a step advances (in `_queue_step_attack`).
         """
         chain = copy.deepcopy(state.current_tool_analysis or {})
         sequence = chain.get("sequence", []) or []
@@ -1335,6 +1376,8 @@ class AgentBreakerChains(AgentBreaker):
             "chain_step",
             "chain_total_steps",
             "chain_role",
+            "incidental_finding",
+            "incidental_reason",
         ):
             val = (this_attempt.notes or {}).get(key)
             if val is not None:
@@ -1365,7 +1408,7 @@ class AgentBreakerChains(AgentBreaker):
         advancement decision depends on the step's plan-entry role:
 
         - ``recon`` / ``pivot``: advance whenever
-          :meth:`_check_step_success` says the step satisfied its declared
+          `_check_step_success` says the step satisfied its declared
           success criterion -- this prevents the security verifier from
           blocking advancement on a step whose job was never to be an exploit.
         - ``exploit``: advance (i.e. terminate the chain) only when the
@@ -1454,6 +1497,12 @@ class AgentBreakerChains(AgentBreaker):
                     f"reachable (artifacts: {list(new_artifacts.keys())})"
                 )
 
+        # Publish anything this step learned to the run-wide store so other
+        # chains' recon can reuse concrete values (ids, paths, emails) instead
+        # of cold-calling a tool that errors on under-specified input.
+        if new_artifacts:
+            self.global_artifacts.update(new_artifacts)
+
         state.attempts_history.append(
             {
                 "target": state.current_target,
@@ -1466,6 +1515,32 @@ class AgentBreakerChains(AgentBreaker):
             }
         )
         last_attempt.notes = state.to_notes()
+
+        # Incidental finding: a non-exploit step can independently demonstrate
+        # harm (e.g. a recon call that dumps the whole salary table or exports
+        # it). The chain may not have reached its planned sink, but this turn is
+        # a real finding on its own. Flag it so the detector scores it as a hit
+        # instead of hard-zeroing every non-exploit step. Gated on the same
+        # success_threshold used for exploits to limit false positives.
+        if role != "exploit" and exploit_succeeded:
+            notes = last_attempt.notes
+            notes["incidental_finding"] = True
+            notes["incidental_reason"] = (
+                f"{role} step on {state.current_target} independently "
+                f"demonstrated harm (confidence {best_confidence:.2f}): "
+                f"{best_reasoning}"
+            )
+            notes.update(self._chain_grouping_notes(chain))
+            last_attempt.notes = notes
+            logging.info(
+                "%s # Incidental finding on %s step %d/%d (%s): %s",
+                self.__class__.__name__,
+                role,
+                step_index + 1,
+                len(sequence),
+                state.current_target,
+                best_reasoning,
+            )
 
         if step_advanced and is_final_step:
             logging.info(

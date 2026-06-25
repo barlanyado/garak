@@ -78,6 +78,8 @@ class TestSubclassWiring:
         assert params["min_edge_confidence"] == 0.4
         assert params["max_step_attempts"] == 3
         assert params["max_active_chains"] == 4
+        assert params["analysis_max_behavior_observations_per_tool"] == 2
+        assert params["analysis_max_behavior_sample_chars"] == 320
         # Single-shot path is gone -- no fallback flag should exist.
         assert "enable_stepwise_chain_fallback" not in params
 
@@ -374,6 +376,93 @@ class TestBuildChainConfigs:
         configs = probe._build_chain_configs()
 
         assert [chain["chain_id"] for _, chain in configs] == ["chain_3", "chain_4"]
+
+
+# ===========================================================================
+# _format_tools_for_analysis — compact chain prompt context
+# ===========================================================================
+
+
+class TestCompactAnalysisContext:
+
+    def test_chain_analysis_context_limits_live_behavior(self):
+        probe = _make_probe(
+            analysis_max_behavior_observations_per_tool=2,
+            analysis_max_behavior_sample_chars=32,
+            analysis_max_behavior_constraints=1,
+            analysis_max_profile_list_items=1,
+            analysis_max_profile_field_chars=36,
+        )
+        probe.agent_config = {
+            "tools": [
+                {
+                    "name": "run_ci_command",
+                    "description": "Run CI commands for PRs",
+                }
+            ]
+        }
+        profiles = {
+            "run_ci_command": {
+                "parameters": [
+                    {"name": "pr_number", "type": "int", "required": True, "description": "target pull request number"},
+                    {"name": "upload_id", "type": "string", "required": False, "description": "uploaded file handle"},
+                ],
+                "input_format": "JSON object with a very long description " + ("x" * 80),
+                "restrictions": ["sandboxed execution", "limited filesystem"],
+            }
+        }
+        behaviors = {
+            "run_ci_command": [
+                {
+                    "probe_prompt": "run pytest",
+                    "outcome": "error",
+                    "output_shape": "stderr plus exit code",
+                    "output_sample": "A" * 120,
+                    "observed_constraints": ["needs valid PR", "pytest missing"],
+                },
+                {
+                    "probe_prompt": "run make",
+                    "outcome": "error",
+                    "output_sample": "B" * 120,
+                    "observed_constraints": ["make missing"],
+                },
+                {
+                    "probe_prompt": "run npm",
+                    "outcome": "error",
+                    "output_sample": "C" * 120,
+                },
+            ]
+        }
+
+        out = probe._format_tools_for_analysis(profiles, behaviors)
+
+        assert "Probe 1:" in out
+        assert "Probe 2:" in out
+        assert "Probe 3:" not in out
+        assert "... (1 more probe(s) omitted)" in out
+        assert "A" * 60 not in out
+        assert "B" * 60 not in out
+        assert "pytest missing" not in out
+        assert "... (1 more)" in out
+        assert "upload_id" not in out
+        assert "more parameter" in out
+        assert "x" * 60 not in out
+
+    def test_chain_analysis_context_can_omit_behavior_when_capped_to_zero(self):
+        probe = _make_probe(analysis_max_behavior_observations_per_tool=0)
+        probe.agent_config = {"tools": [{"name": "list_pull_requests", "description": "List PRs"}]}
+
+        out = probe._format_tools_for_analysis(
+            tool_behaviors={
+                "list_pull_requests": [
+                    {"probe_prompt": "list PRs", "output_sample": "app #5"}
+                ]
+            }
+        )
+
+        assert "### Tool: list_pull_requests" in out
+        assert "Observed behavior" not in out
+        assert "app #5" not in out
 
 
 # ===========================================================================

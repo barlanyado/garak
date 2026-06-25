@@ -75,6 +75,14 @@ class AgentBreakerChains(AgentBreaker):
         # search is capped by ``max_chains``, but hypothesis fan-out can produce
         # more executable lines than a bounded run can drive to a terminal sink.
         "max_active_chains": 4,
+        # Chain planning reuses live blackbox recon/behavioral observations, but
+        # large per-tool transcripts can make the inherited weakness-analysis
+        # prompt repeatedly time out. Bound the rendered context for chain runs.
+        "analysis_max_behavior_observations_per_tool": 2,
+        "analysis_max_behavior_sample_chars": 320,
+        "analysis_max_behavior_constraints": 4,
+        "analysis_max_profile_list_items": 6,
+        "analysis_max_profile_field_chars": 500,
         # How many DISTINCT exploit techniques to try per discovered chain path.
         # Each becomes its own independent attack line so the probe explores
         # multiple hypotheses (e.g. path traversal vs planting executable
@@ -322,6 +330,183 @@ class AgentBreakerChains(AgentBreaker):
     # ------------------------------------------------------------------
     # Chain discovery pipeline
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compact_text(value: object, limit: int) -> str:
+        """Collapse whitespace and cap rendered recon context."""
+        text = " ".join(str(value or "").split())
+        if not text or limit <= 0 or len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip() + "..."
+
+    @staticmethod
+    def _safe_int_param(value: object, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _analysis_context_limits(self) -> dict:
+        return {
+            "observations": max(
+                0,
+                self._safe_int_param(
+                    getattr(self, "analysis_max_behavior_observations_per_tool", 2),
+                    2,
+                ),
+            ),
+            "sample_chars": max(
+                0,
+                self._safe_int_param(
+                    getattr(self, "analysis_max_behavior_sample_chars", 320),
+                    320,
+                ),
+            ),
+            "constraints": max(
+                0,
+                self._safe_int_param(
+                    getattr(self, "analysis_max_behavior_constraints", 4),
+                    4,
+                ),
+            ),
+            "profile_items": max(
+                0,
+                self._safe_int_param(
+                    getattr(self, "analysis_max_profile_list_items", 6),
+                    6,
+                ),
+            ),
+            "profile_chars": max(
+                0,
+                self._safe_int_param(
+                    getattr(self, "analysis_max_profile_field_chars", 500),
+                    500,
+                ),
+            ),
+        }
+
+    def _format_compact_tool_profile(self, profile: dict, limits: dict) -> str:
+        """Render deep-recon profile fields without pasting the whole transcript."""
+        if not profile:
+            return ""
+        lines = ["Deep recon profile (compact, from agent's own description):"]
+        max_items = limits["profile_items"]
+        field_limit = limits["profile_chars"]
+
+        params = profile.get("parameters") or []
+        if params:
+            lines.append("  Parameters:")
+            for p in params[:max_items]:
+                name = p.get("name", "?")
+                ptype = p.get("type", "?")
+                required = "required" if p.get("required") else "optional"
+                desc = self._compact_text(p.get("description", ""), field_limit)
+                suffix = f": {desc}" if desc else ""
+                lines.append(f"    - {name} ({ptype}, {required}){suffix}")
+            if len(params) > max_items:
+                lines.append(f"    - ... ({len(params) - max_items} more parameter(s))")
+
+        for label, key in (
+            ("Input format", "input_format"),
+            ("Output format", "output_format"),
+            ("Security notes", "security_notes"),
+        ):
+            value = self._compact_text(profile.get(key), field_limit)
+            if value:
+                lines.append(f"  {label}: {value}")
+
+        for label, key in (("Restrictions", "restrictions"), ("Examples", "examples")):
+            values = profile.get(key) or []
+            if not values:
+                continue
+            lines.append(f"  {label}:")
+            for value in values[:max_items]:
+                lines.append(f"    - {self._compact_text(value, field_limit)}")
+            if len(values) > max_items:
+                lines.append(f"    - ... ({len(values) - max_items} more)")
+
+        return "\n".join(lines) + "\n"
+
+    def _format_compact_tool_behavior(
+        self,
+        observations: list,
+        limits: dict,
+        header: str = "Observed behavior (compact, from benign live calls to the target):",
+    ) -> str:
+        """Render live observations in bounded form for chain-model prompts."""
+        if not observations:
+            return ""
+        max_obs = limits["observations"]
+        if max_obs <= 0:
+            return ""
+        sample_limit = limits["sample_chars"]
+        max_constraints = limits["constraints"]
+        lines = [header]
+        for i, obs in enumerate(observations[:max_obs], start=1):
+            lines.append(f"  Probe {i}:")
+            for label, key in (
+                ("Probe prompt", "probe_prompt"),
+                ("Outcome", "outcome"),
+                ("Output shape", "output_shape"),
+                ("Output sample", "output_sample"),
+                ("Error signature", "error_signature"),
+                ("Refusal signature", "refusal_signature"),
+            ):
+                value = self._compact_text(obs.get(key), sample_limit)
+                if value:
+                    lines.append(f"    {label}: {value}")
+            constraints = obs.get("observed_constraints") or []
+            if constraints and max_constraints > 0:
+                lines.append("    Observed constraints:")
+                for constraint in constraints[:max_constraints]:
+                    lines.append(f"      - {self._compact_text(constraint, sample_limit)}")
+                if len(constraints) > max_constraints:
+                    lines.append(
+                        f"      - ... ({len(constraints) - max_constraints} more)"
+                    )
+        if len(observations) > max_obs:
+            lines.append(f"  ... ({len(observations) - max_obs} more probe(s) omitted)")
+        return "\n".join(lines) + "\n"
+
+    def _format_tools_for_analysis(
+        self,
+        tool_profiles: Optional[dict] = None,
+        tool_behaviors: Optional[dict] = None,
+        tool_fault_signatures: Optional[dict] = None,
+    ) -> str:
+        """Compact chain-analysis context while preserving blackbox evidence."""
+        tool_profiles = tool_profiles or {}
+        tool_behaviors = tool_behaviors or {}
+        tool_fault_signatures = tool_fault_signatures or {}
+        limits = self._analysis_context_limits()
+        sections: List[str] = []
+        for tool in self.agent_config.get("tools", []):
+            tool_name = tool.get("name", "unnamed")
+            lines = [
+                f"### Tool: {tool_name}",
+                f"Description: {tool.get('description', 'No description')}",
+            ]
+            profile = self._format_compact_tool_profile(
+                tool_profiles.get(tool_name) or {},
+                limits,
+            )
+            if profile:
+                lines.append(profile.rstrip())
+            behavior = self._format_compact_tool_behavior(
+                tool_behaviors.get(tool_name) or [],
+                limits,
+            )
+            if behavior:
+                lines.append(behavior.rstrip())
+            fault_behavior = self._format_compact_tool_behavior(
+                tool_fault_signatures.get(tool_name) or [],
+                limits,
+                header="Fault signatures (compact, from malformed inputs to the target):",
+            )
+            if fault_behavior:
+                lines.append(fault_behavior.rstrip())
+            sections.append("\n".join(lines))
+        return "\n\n".join(sections)
 
     @staticmethod
     def _format_per_tool_analyses(tool_analyses: dict) -> str:

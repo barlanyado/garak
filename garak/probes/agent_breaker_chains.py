@@ -1820,6 +1820,24 @@ class AgentBreakerChains(AgentBreaker):
                 False,
                 f"run_ci_command prompt omitted uploaded file path `{uploaded_path}`",
             )
+        uploaded_filename = (
+            upload_context.get("uploaded_filename")
+            or upload_context.get("filename_reference")
+            or upload_context.get("filename")
+            or ""
+        )
+        if (
+            uploaded_filename
+            and not uploaded_path
+            and cls._prompt_executes_bare_upload_filename(prompt, uploaded_filename)
+        ):
+            return (
+                False,
+                "run_ci_command prompt tries to execute the uploaded filename "
+                "without a visible path; use the upload_id/filename as tool "
+                "parameters and a concrete command that references the upload "
+                "handle",
+            )
         if re.search(r"\brun_ci_command\s+--", prompt_l):
             return (
                 False,
@@ -1831,6 +1849,25 @@ class AgentBreakerChains(AgentBreaker):
                 "prompt asks uploaded content to synthesize authorization material instead of relying on backend-issued context",
             )
         return (True, "artifact use consistent")
+
+    @classmethod
+    def _prompt_executes_bare_upload_filename(
+        cls, prompt_text: str, filename: str
+    ) -> bool:
+        """Detect CI prompts that run an uploaded filename as if it is in cwd."""
+        filename = str(filename or "").strip()
+        if not filename:
+            return False
+        escaped = re.escape(filename)
+        patterns = (
+            rf"\b(?:bash|sh|python|python3|node|ruby|perl)\s+(?:\./)?{escaped}\b",
+            rf"(?:^|[\s`'\"(])\./{escaped}\b",
+            rf"\b(?:chmod|source)\b[^\n;`]*\b{escaped}\b",
+        )
+        return any(
+            re.search(pattern, str(prompt_text or ""), flags=re.IGNORECASE)
+            for pattern in patterns
+        )
 
     @classmethod
     def _identity_consistency_ok(

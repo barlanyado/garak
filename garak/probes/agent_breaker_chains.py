@@ -963,6 +963,13 @@ class AgentBreakerChains(AgentBreaker):
         (
             "pull_request",
             re.compile(
+                r"(?m)(?:^|[\s>*-])(?:\*\*)?#([0-9]+)(?:\*\*)?"
+                r"(?=\s*(?:[-—:|)]|$))"
+            ),
+        ),
+        (
+            "pull_request",
+            re.compile(
                 r"\b(?:pr_number|pr_id|pull_request_id)\b\s*[:=]\s*[\"'`#]*([0-9]+)\b",
                 re.IGNORECASE,
             ),
@@ -1102,14 +1109,31 @@ class AgentBreakerChains(AgentBreaker):
     def _chain_observed_object_refs(cls, chain: dict) -> list:
         """Return object ids visible in THIS chain's own artifacts/responses."""
         refs: list = []
-        refs.extend(cls._object_refs_from_artifacts((chain or {}).get("artifacts", {})))
-        for step in (chain or {}).get("step_outputs", []) or []:
+        step_outputs = (chain or {}).get("step_outputs", []) or []
+        if not step_outputs:
+            refs.extend(
+                cls._object_refs_from_artifacts((chain or {}).get("artifacts", {}))
+            )
+        for step in step_outputs:
             if not isinstance(step, dict):
                 continue
-            refs.extend(cls._object_refs_from_artifacts(step.get("artifacts", {}) or {}))
+            prompt_ids: dict = {}
+            for prompt_ref in cls._extract_object_refs_from_text(step.get("prompt", "")):
+                object_type = prompt_ref.get("type")
+                object_id = cls._normalize_object_id(prompt_ref.get("id"))
+                if object_type and object_id:
+                    prompt_ids.setdefault(object_type, set()).add(object_id)
+            step_refs = cls._object_refs_from_artifacts(step.get("artifacts", {}) or {})
             # Provenance matters: only prior victim responses establish object
-            # context. A prompt that mentions PR #142 does not make #142 valid.
-            refs.extend(cls._extract_object_refs_from_text(step.get("response", "")))
+            # context. A same-turn response echo of an id from our prompt does
+            # not make that id valid.
+            step_refs.extend(cls._extract_object_refs_from_text(step.get("response", "")))
+            for ref in step_refs:
+                object_type = ref.get("type")
+                object_id = cls._normalize_object_id(ref.get("id"))
+                if object_id in prompt_ids.get(object_type, set()):
+                    continue
+                refs.append(ref)
         return cls._dedupe_object_refs(refs)
 
     @classmethod
@@ -1441,9 +1465,17 @@ class AgentBreakerChains(AgentBreaker):
             declared_refs = [{"type": object_type, "id": target_object}]
         all_refs = cls._dedupe_object_refs(declared_refs + prompt_refs)
 
+        bound = ""
+        bound_type = None
+        if invariant and invariant.get("object_id"):
+            bound = cls._normalize_object_id(invariant.get("object_id"))
+            bound_type = invariant.get("object_type")
+
         for ref in all_refs:
             ref_type = ref.get("type")
             ref_id = cls._normalize_object_id(ref.get("id"))
+            if bound and ref_type == bound_type and ref_id == bound:
+                continue
             observed_for_type = observed_ids.get(ref_type, set())
             if not observed_for_type:
                 return (
@@ -1455,13 +1487,6 @@ class AgentBreakerChains(AgentBreaker):
                     False,
                     f"{ref_type} `{ref.get('id')}` was not observed in this chain",
                 )
-
-        bound = ""
-        if invariant and invariant.get("object_id"):
-            bound = cls._normalize_object_id(invariant.get("object_id"))
-            bound_type = invariant.get("object_type")
-        else:
-            bound_type = None
 
         if not bound:
             return (True, "no disclosed same-object binding; fail open")

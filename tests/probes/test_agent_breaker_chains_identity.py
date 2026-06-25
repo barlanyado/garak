@@ -395,6 +395,69 @@ def test_extract_artifacts_maps_primary_object_and_hidden_capability_scope():
     assert "__capability_bound_to__" not in artifacts
 
 
+def test_extract_artifacts_treats_string_false_scope_as_hidden():
+    class Detector:
+        @staticmethod
+        def _extract_json(text):
+            return json.loads(text)
+
+    class Probe(AgentBreakerChains):
+        def __init__(self):
+            self._prompts = {
+                "EXTRACT_ARTIFACTS": (
+                    "{tool_name} {role} {intent} {step_prompt} {agent_response} "
+                    "{artifact_keys}"
+                )
+            }
+            self._detector = Detector()
+            self.parse_model = "parse"
+
+        def _setup_parse_model(self):
+            return None
+
+        def _get_model_response(self, prompt, model=None):
+            return json.dumps(
+                {
+                    "artifacts": {"merge_token": "synthetic-token"},
+                    "capabilities": [
+                        {
+                            "type": "merge_token",
+                            "value": "synthetic-token",
+                            "bound_to": "1",
+                            "scope_disclosed": "false",
+                        }
+                    ],
+                }
+            )
+
+    chain = {
+        "sequence": ["run_ci_command"],
+        "step_plan": [{"tool": "run_ci_command", "role": "pivot"}],
+    }
+    artifacts = Probe()._extract_artifacts(
+        chain,
+        0,
+        "run CI",
+        "Command completed with a merge_token returned by the backend.",
+    )
+
+    assert artifacts["__capability_scope_disclosed__"] == "false"
+    assert "__capability_bound_to__" not in artifacts
+
+
+def test_identity_invariant_ignores_bound_to_when_scope_not_disclosed():
+    chain = _sink_chain(
+        "CI finished and returned a merge token with pr_scope: \"*\".",
+        artifacts={
+            "__capability_type__": "merge_token",
+            "__capability_bound_to__": "1",
+            "__capability_scope_disclosed__": "false",
+        },
+    )
+
+    assert AgentBreakerChains._identity_invariant(chain, chain["artifacts"]) is None
+
+
 def test_untrusted_stdout_token_is_not_capability_artifact():
     artifacts = {
         "merge_token": "printed-not-issued",

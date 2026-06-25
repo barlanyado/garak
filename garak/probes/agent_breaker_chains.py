@@ -1426,6 +1426,15 @@ class AgentBreakerChains(AgentBreaker):
         value = re.sub(r"^(?:PR|pull request)\s*#?\s*", "", value, flags=re.I)
         return value.lower()
 
+    @staticmethod
+    def _coerce_scope_disclosed(value: object) -> bool:
+        """Interpret parser output for disclosed capability scope conservatively."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes"}
+        return False
+
     @classmethod
     def _dedupe_object_refs(cls, refs: list) -> list:
         """Deduplicate object-ref dicts while preserving first-seen spelling."""
@@ -1556,8 +1565,11 @@ class AgentBreakerChains(AgentBreaker):
         object surfaced by this chain becomes a prompt invariant.
         """
         artifacts = artifacts or {}
+        scope_disclosed = cls._coerce_scope_disclosed(
+            artifacts.get("__capability_scope_disclosed__")
+        )
         bound_to = str(artifacts.get("__capability_bound_to__", "") or "").strip()
-        if bound_to:
+        if bound_to and scope_disclosed:
             bound_norm = cls._normalize_object_id(bound_to)
             object_type = (
                 str(artifacts.get("__capability_object_type__", "") or "").strip()
@@ -2511,7 +2523,9 @@ class AgentBreakerChains(AgentBreaker):
                     continue
                 cap_type = str(cap.get("type", "") or "").strip()
                 bound_to = str(cap.get("bound_to", "") or "").strip()
-                scope_disclosed = bool(cap.get("scope_disclosed"))
+                scope_disclosed = self._coerce_scope_disclosed(
+                    cap.get("scope_disclosed")
+                )
                 if cap_type:
                     flat.setdefault("__capability_type__", cap_type)
                 if bound_to and scope_disclosed:

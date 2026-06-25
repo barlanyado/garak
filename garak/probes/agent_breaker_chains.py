@@ -222,7 +222,7 @@ class AgentBreakerChains(AgentBreaker):
                     return True
         return False
 
-    def _chain_completion_priority(self, chain: dict) -> Tuple[int, int, int, int]:
+    def _chain_completion_priority(self, chain: dict) -> Tuple[int, int, int, int, int]:
         """Prefer chains likely to reach a terminal privileged sink.
 
         The iterative scheduler starts with every seed attempt before following
@@ -233,7 +233,7 @@ class AgentBreakerChains(AgentBreaker):
         """
         sequence = [str(t).lower() for t in (chain.get("sequence") or [])]
         if not sequence:
-            return (0, 0, 0, 0)
+            return (0, 0, 0, 0, 0)
         sink = sequence[-1]
         sink_tags = self.tool_tags.get(sink, {}) or {}
         sink_text = " ".join(
@@ -256,9 +256,26 @@ class AgentBreakerChains(AgentBreaker):
         ci_sink = int(
             self._ordered_subsequence(sequence, ("run_ci_command", "merge_pr"))
         )
+        try:
+            run_ci_idx = sequence.index("run_ci_command")
+        except ValueError:
+            run_ci_idx = len(sequence)
+        visible_pr_context = int(
+            any(
+                tool in self._PULL_REQUEST_CONTEXT_TOOLS
+                for tool in sequence[:run_ci_idx]
+            )
+        )
+        upload_pr_ci_sink = int(upload_ci_sink and visible_pr_context)
         # Prefer shorter chains after the required capability path is present so
         # bounded runs reach the terminal sink sooner.
-        return (privileged_sink, upload_ci_sink, ci_sink, -len(sequence))
+        return (
+            privileged_sink,
+            upload_pr_ci_sink,
+            upload_ci_sink,
+            ci_sink,
+            -len(sequence),
+        )
 
     def _build_chain_configs(self) -> List[Tuple[str, dict]]:
         """Extract (entry_tool, chain_dict) tuples from agent_analysis.
@@ -766,11 +783,29 @@ class AgentBreakerChains(AgentBreaker):
                 augmented.append(path)
                 continue
 
+            original_sequence = list(sequence)
             if len(sequence) >= self.max_chain_len:
-                augmented.append(path)
-                continue
-
-            sequence.insert(consumer_idx, recon_tool)
+                replace_idx = next(
+                    (
+                        idx
+                        for idx, tool in enumerate(sequence[:consumer_idx])
+                        if tool != "upload_file"
+                        and tool not in self._PULL_REQUEST_CONTEXT_TOOLS
+                    ),
+                    None,
+                )
+                if replace_idx is None:
+                    augmented.append(path)
+                    continue
+                removed = sequence[replace_idx]
+                sequence[replace_idx] = recon_tool
+                edges = [
+                    e
+                    for e in edges
+                    if e.get("from") != removed and e.get("to") != removed
+                ]
+            else:
+                sequence.insert(consumer_idx, recon_tool)
             edges.append(
                 {
                     "from": recon_tool,
@@ -787,7 +822,7 @@ class AgentBreakerChains(AgentBreaker):
                 "%s # Added %s context step before run_ci_command for chain %s",
                 self.__class__.__name__,
                 recon_tool,
-                " -> ".join(path.get("sequence") or []),
+                " -> ".join(original_sequence),
             )
             augmented.append({**path, "sequence": sequence, "edges": edges})
         return augmented
@@ -1304,6 +1339,10 @@ class AgentBreakerChains(AgentBreaker):
                 r"(?m)(?:^|[\s>*-])(?:\*\*)?#([0-9]+)(?:\*\*)?"
                 r"(?=\s*(?:[-—:|)]|$))"
             ),
+        ),
+        (
+            "pull_request",
+            re.compile(r"(?m)^\s*\|\s*[A-Za-z0-9_.-]+\s*\|\s*#?([0-9]+)\s*\|"),
         ),
         (
             "pull_request",

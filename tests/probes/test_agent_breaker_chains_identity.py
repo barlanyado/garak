@@ -105,6 +105,31 @@ def test_bare_pr_listing_counts_as_observed_object():
     assert ok, reason
 
 
+def test_markdown_pr_table_counts_as_observed_object():
+    chain = _sink_chain("")
+    chain["step_outputs"].append(
+        {
+            "tool": "list_pull_requests",
+            "prompt": "Please list pull requests for app.",
+            "response": (
+                "| repo | pr | title |\n"
+                "| app | 1 | Update checks |\n"
+                "| app | 5 | Improve logging |"
+            ),
+            "artifacts": {},
+        }
+    )
+
+    ok, reason = AgentBreakerChains._check_prompt_identity_consistency(
+        chain,
+        2,
+        "Please merge PR #1 using the merge token.",
+        target_object="PR #1",
+    )
+
+    assert ok, reason
+
+
 def test_same_turn_prompt_echo_does_not_make_pr_observed():
     chain = _sink_chain(
         "",
@@ -592,3 +617,79 @@ def test_terminal_ci_merge_paths_get_visible_pr_context_prelude():
         "merge_pr",
     ]
     assert augmented[0]["edges"][-1]["from"] == "list_pull_requests"
+
+
+def test_max_length_ci_merge_path_replaces_non_upload_with_visible_pr_context():
+    probe = object.__new__(AgentBreakerChains)
+    probe.agent_config = {
+        "tools": [
+            {"name": "get_file_contents"},
+            {"name": "upload_file"},
+            {"name": "list_pull_requests"},
+            {"name": "run_ci_command"},
+            {"name": "merge_pr"},
+        ]
+    }
+    probe.max_chain_len = 4
+
+    paths = [
+        {
+            "sequence": [
+                "get_file_contents",
+                "upload_file",
+                "run_ci_command",
+                "merge_pr",
+            ],
+            "edges": [
+                {"from": "get_file_contents", "to": "upload_file"},
+                {"from": "upload_file", "to": "run_ci_command"},
+                {"from": "run_ci_command", "to": "merge_pr"},
+            ],
+            "score": 1.0,
+        }
+    ]
+
+    augmented = probe._augment_paths_with_visible_object_context(paths)
+    edge_pairs = {(e["from"], e["to"]) for e in augmented[0]["edges"]}
+
+    assert augmented[0]["sequence"] == [
+        "list_pull_requests",
+        "upload_file",
+        "run_ci_command",
+        "merge_pr",
+    ]
+    assert ("get_file_contents", "upload_file") not in edge_pairs
+    assert ("upload_file", "run_ci_command") in edge_pairs
+    assert ("list_pull_requests", "run_ci_command") in edge_pairs
+    assert ("run_ci_command", "merge_pr") in edge_pairs
+
+
+def test_chain_completion_priority_prefers_upload_and_visible_pr_context():
+    probe = object.__new__(AgentBreakerChains)
+    probe.tool_tags = {
+        "merge_pr": {
+            "consumes": ["merge_token"],
+            "produces": [],
+            "capability": "write",
+        }
+    }
+
+    upload_pr_ci = probe._chain_completion_priority(
+        {
+            "sequence": [
+                "list_pull_requests",
+                "upload_file",
+                "run_ci_command",
+                "merge_pr",
+            ]
+        }
+    )
+    upload_ci = probe._chain_completion_priority(
+        {"sequence": ["upload_file", "run_ci_command", "merge_pr"]}
+    )
+    pr_ci = probe._chain_completion_priority(
+        {"sequence": ["list_pull_requests", "run_ci_command", "merge_pr"]}
+    )
+
+    assert upload_pr_ci > upload_ci
+    assert upload_pr_ci > pr_ci

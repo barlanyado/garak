@@ -71,6 +71,10 @@ class AgentBreakerChains(AgentBreaker):
         "min_edge_confidence": 0.4,
         # Per-step attempt budget (initial + refinements) during stepwise chain execution.
         "max_step_attempts": 3,
+        # Maximum number of expanded, planned chain lines to seed at once. Path
+        # search is capped by ``max_chains``, but hypothesis fan-out can produce
+        # more executable lines than a bounded run can drive to a terminal sink.
+        "max_active_chains": 4,
         # How many DISTINCT exploit techniques to try per discovered chain path.
         # Each becomes its own independent attack line so the probe explores
         # multiple hypotheses (e.g. path traversal vs planting executable
@@ -161,7 +165,7 @@ class AgentBreakerChains(AgentBreaker):
 
         chain_configs = self._build_chain_configs()
 
-        # Budget the iterative loop: every chain runs as a plan-driven sequence
+        # Budget the iterative loop: every active chain runs as a plan-driven sequence
         # of up to ``max_chain_len`` steps, each step with up to
         # ``max_step_attempts`` initial+refinement turns.
         budget_per_chain = self.max_chain_len * self.max_step_attempts
@@ -193,6 +197,58 @@ class AgentBreakerChains(AgentBreaker):
                 )
 
         return all_attempts
+
+    @classmethod
+    def _ordered_subsequence(cls, sequence: List[str], required: Tuple[str, ...]) -> bool:
+        """Return whether ``required`` appears in order inside ``sequence``."""
+        if not required:
+            return True
+        pos = 0
+        lowered = [str(item).lower() for item in sequence]
+        for item in lowered:
+            if item == required[pos]:
+                pos += 1
+                if pos >= len(required):
+                    return True
+        return False
+
+    def _chain_completion_priority(self, chain: dict) -> Tuple[int, int, int, int]:
+        """Prefer chains likely to reach a terminal privileged sink.
+
+        The iterative scheduler starts with every seed attempt before following
+        stepwise continuations. Under a bounded run, too many shallow chains can
+        starve the lines that need upload/CI/auth material before a final sink.
+        Keep this deterministic and blackbox-only: use public tool names and
+        capability tags, not backend truth.
+        """
+        sequence = [str(t).lower() for t in (chain.get("sequence") or [])]
+        if not sequence:
+            return (0, 0, 0, 0)
+        sink = sequence[-1]
+        sink_tags = self.tool_tags.get(sink, {}) or {}
+        sink_text = " ".join(
+            [
+                sink,
+                " ".join(str(x).lower() for x in sink_tags.get("consumes", []) or []),
+                " ".join(str(x).lower() for x in sink_tags.get("produces", []) or []),
+                str(sink_tags.get("capability", "") or "").lower(),
+            ]
+        )
+        privileged_sink = int(
+            any(term in sink_text for term in ("merge", "approve", "deploy", "write"))
+            or any(term in sink_text for term in self._CAPABILITY_ARTIFACT_KEYS)
+        )
+        upload_ci_sink = int(
+            self._ordered_subsequence(
+                sequence, ("upload_file", "run_ci_command", "merge_pr")
+            )
+        )
+        ci_sink = int(
+            self._ordered_subsequence(sequence, ("run_ci_command", "merge_pr"))
+        )
+        # Prefer shorter chains after the required capability path is present so
+        # bounded runs reach the terminal sink sooner.
+        return (privileged_sink, upload_ci_sink, ci_sink, -len(sequence))
 
     def _build_chain_configs(self) -> List[Tuple[str, dict]]:
         """Extract (entry_tool, chain_dict) tuples from agent_analysis.
@@ -242,6 +298,24 @@ class AgentBreakerChains(AgentBreaker):
             configs.append((entry_tool, {**chain, "is_chain": True}))
             if chain_id:
                 seen_ids.add(chain_id)
+
+        configs.sort(
+            key=lambda item: self._chain_completion_priority(item[1]),
+            reverse=True,
+        )
+
+        try:
+            max_active = int(getattr(self, "max_active_chains", self.max_chains) or 0)
+        except (TypeError, ValueError):
+            max_active = 0
+        if max_active > 0 and len(configs) > max_active:
+            logging.info(
+                "%s # Seeding top %d/%d expanded chains after completion-priority ranking",
+                self.__class__.__name__,
+                max_active,
+                len(configs),
+            )
+            configs = configs[:max_active]
 
         return configs
 

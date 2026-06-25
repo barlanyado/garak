@@ -77,6 +77,7 @@ class TestSubclassWiring:
         assert params["max_chain_len"] == 4
         assert params["min_edge_confidence"] == 0.4
         assert params["max_step_attempts"] == 3
+        assert params["max_active_chains"] == 4
         # Single-shot path is gone -- no fallback flag should exist.
         assert "enable_stepwise_chain_fallback" not in params
 
@@ -296,6 +297,83 @@ class TestBuildChainConfigs:
         }
         configs = probe._build_chain_configs()
         assert configs[0][0] == "x"
+
+    def test_prioritizes_completion_path_over_shallow_incidental_chains(self):
+        probe = _make_probe(max_active_chains=4)
+        probe.agent_analysis = {
+            "chains": [
+                {
+                    "chain_id": "chain_1",
+                    "sequence": ["upload_file", "run_file"],
+                },
+                {
+                    "chain_id": "chain_2",
+                    "sequence": ["run_ci_command", "merge_pr"],
+                },
+                {
+                    "chain_id": "chain_3",
+                    "sequence": ["upload_file", "run_ci_command", "merge_pr"],
+                },
+                {
+                    "chain_id": "chain_4",
+                    "sequence": [
+                        "get_file_contents",
+                        "upload_file",
+                        "run_ci_command",
+                        "merge_pr",
+                    ],
+                },
+            ],
+            "priority_chains": [
+                "chain_1 - score 99.0",
+                "chain_2 - score 10.0",
+                "chain_3 - score 9.0",
+                "chain_4 - score 8.0",
+            ],
+        }
+
+        configs = probe._build_chain_configs()
+        ids = [chain["chain_id"] for _, chain in configs]
+
+        assert ids[:3] == ["chain_3", "chain_4", "chain_2"]
+
+    def test_caps_expanded_active_chains_after_completion_priority(self):
+        probe = _make_probe(max_active_chains=2)
+        probe.agent_analysis = {
+            "chains": [
+                {
+                    "chain_id": "chain_1",
+                    "sequence": ["upload_file", "run_file"],
+                },
+                {
+                    "chain_id": "chain_2",
+                    "sequence": ["run_ci_command", "merge_pr"],
+                },
+                {
+                    "chain_id": "chain_3",
+                    "sequence": ["upload_file", "run_ci_command", "merge_pr"],
+                },
+                {
+                    "chain_id": "chain_4",
+                    "sequence": [
+                        "get_file_contents",
+                        "upload_file",
+                        "run_ci_command",
+                        "merge_pr",
+                    ],
+                },
+            ],
+            "priority_chains": [
+                "chain_1 - score 99.0",
+                "chain_2 - score 10.0",
+                "chain_3 - score 9.0",
+                "chain_4 - score 8.0",
+            ],
+        }
+
+        configs = probe._build_chain_configs()
+
+        assert [chain["chain_id"] for _, chain in configs] == ["chain_3", "chain_4"]
 
 
 # ===========================================================================

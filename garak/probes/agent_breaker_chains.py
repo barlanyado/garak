@@ -1987,6 +1987,8 @@ class AgentBreakerChains(AgentBreaker):
         escaped = re.escape(filename)
         patterns = (
             rf"\b(?:bash|sh|python|python3|node|ruby|perl)\s+(?:\./)?{escaped}\b",
+            rf"\b(?:cat|grep|egrep|fgrep|sed|awk|head|tail|wc|stat|file|"
+            rf"ls|du|sha256sum|md5sum)\b[^\n;`]*\b(?:\./)?{escaped}\b",
             rf"(?:^|[\s`'\"(])\./{escaped}\b",
             rf"\b(?:chmod|source)\b[^\n;`]*\b{escaped}\b",
         )

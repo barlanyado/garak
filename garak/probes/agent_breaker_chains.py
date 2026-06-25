@@ -122,6 +122,7 @@ class AgentBreakerChains(AgentBreaker):
         "path",
         "script_path",
     )
+    _UPLOAD_PATH_ARTIFACT_KEYS = ("build_host_path", "stored_path", "path")
     _OBJECT_CONTEXT_RECON_TOOLS = ("list_pull_requests", "get_pr")
     _PULL_REQUEST_CONTEXT_TOOLS = {"list_pull_requests", "get_pr"}
 
@@ -1806,6 +1807,19 @@ class AgentBreakerChains(AgentBreaker):
             return (False, f"run_ci_command prompt omitted upload_id `{upload_id}`")
         if upload_id and "upload_id" not in prompt_l and "upload id" not in prompt_l:
             return (False, "run_ci_command prompt named an upload value but not the upload_id parameter")
+        uploaded_path = next(
+            (
+                upload_context.get(key, "")
+                for key in cls._UPLOAD_PATH_ARTIFACT_KEYS
+                if upload_context.get(key)
+            ),
+            "",
+        )
+        if uploaded_path and uploaded_path not in prompt:
+            return (
+                False,
+                f"run_ci_command prompt omitted uploaded file path `{uploaded_path}`",
+            )
         if re.search(r"\brun_ci_command\s+--", prompt_l):
             return (
                 False,

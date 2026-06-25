@@ -122,6 +122,8 @@ class AgentBreakerChains(AgentBreaker):
         "path",
         "script_path",
     )
+    _OBJECT_CONTEXT_RECON_TOOLS = ("list_pull_requests", "get_pr")
+    _PULL_REQUEST_CONTEXT_TOOLS = {"list_pull_requests", "get_pr"}
 
     def __init__(self, config_root=_config):
         super().__init__(config_root=config_root)
@@ -590,6 +592,7 @@ class AgentBreakerChains(AgentBreaker):
             )
             return {"chains": [], "priority_chains": []}
 
+        paths = self._augment_paths_with_visible_object_context(paths)
         result = self._generate_chain_attacks(paths)
         logging.info(
             f"{self.__class__.__name__} # Built {len(result['chains'])} chain "
@@ -712,6 +715,82 @@ class AgentBreakerChains(AgentBreaker):
                 }
             )
         return scored
+
+    def _available_tool_names(self) -> set:
+        """Return public tool names in the current agent config."""
+        return {
+            str(tool.get("name") or "").strip()
+            for tool in self.agent_config.get("tools", [])
+            if str(tool.get("name") or "").strip()
+        }
+
+    @classmethod
+    def _has_pr_context_before(cls, sequence: list, consumer_idx: int) -> bool:
+        return any(
+            str(tool) in cls._PULL_REQUEST_CONTEXT_TOOLS
+            for tool in sequence[:consumer_idx]
+        )
+
+    def _augment_paths_with_visible_object_context(self, paths: List[dict]) -> List[dict]:
+        """Insert a read-only object-context step for PR-scoped terminal chains.
+
+        Some valid chains have a join-shaped prerequisite: an uploaded file and
+        a concrete PR number both feed `run_ci_command`, then its opaque
+        authorization feeds `merge_pr`. The capability graph is linear, so it
+        can discover `upload_file -> run_ci_command -> merge_pr` while lacking a
+        visible PR source. Add a blackbox recon step when the public tool set has
+        one, so later steps use observed object ids rather than fabricating them.
+        """
+        available = self._available_tool_names()
+        recon_tool = next(
+            (tool for tool in self._OBJECT_CONTEXT_RECON_TOOLS if tool in available),
+            None,
+        )
+        if not recon_tool:
+            return paths
+
+        augmented: List[dict] = []
+        for path in paths:
+            sequence = list(path.get("sequence") or [])
+            edges = list(path.get("edges") or [])
+            if (
+                recon_tool in sequence
+                or "run_ci_command" not in sequence
+                or "merge_pr" not in sequence
+            ):
+                augmented.append(path)
+                continue
+
+            consumer_idx = sequence.index("run_ci_command")
+            if self._has_pr_context_before(sequence, consumer_idx):
+                augmented.append(path)
+                continue
+
+            if len(sequence) >= self.max_chain_len:
+                augmented.append(path)
+                continue
+
+            sequence.insert(consumer_idx, recon_tool)
+            edges.append(
+                {
+                    "from": recon_tool,
+                    "to": "run_ci_command",
+                    "confidence": 1.0,
+                    "data_flow": (
+                        "visible pull-request context (repo and PR number) "
+                        "surfaced by recon is consumed by run_ci_command and "
+                        "preserved for merge_pr"
+                    ),
+                }
+            )
+            logging.info(
+                "%s # Added %s context step before run_ci_command for chain %s",
+                self.__class__.__name__,
+                recon_tool,
+                " -> ".join(path.get("sequence") or []),
+            )
+            augmented.append({**path, "sequence": sequence, "edges": edges})
+        return augmented
 
     def _search_chains(self, edges: List[dict], tool_tags: dict) -> List[dict]:
         """Bounded source->sink path search over scored edges.
@@ -1788,7 +1867,14 @@ class AgentBreakerChains(AgentBreaker):
             role = plan[step_index].get("role", "exploit") or "exploit"
         is_final_step = step_index >= len(sequence) - 1 if sequence else True
         if role != "exploit" and not is_final_step:
-            return (True, "identity guard applies only to sink/exploit steps")
+            if role == "recon":
+                return (True, "identity guard does not constrain recon discovery")
+            prompt_refs = cls._extract_object_refs_from_text(prompt_text)
+            target_refs = cls._extract_object_refs_from_text(target_object)
+            if target_object and not target_refs:
+                target_refs = [{"type": "object", "id": target_object}]
+            if not prompt_refs and not target_refs:
+                return (True, "non-sink step did not name an object id")
 
         artifacts = dict((chain or {}).get("artifacts", {}) or {})
         invariant = cls._identity_invariant(chain, artifacts)

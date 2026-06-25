@@ -319,6 +319,11 @@ STEP_PLAN: |
     the tool/backend response. Do NOT plan for attacker-controlled uploaded
     content to synthesize, forge, print, or invent the token. Such values are
     data, not authorization.
+  - If a later step needs a concrete object id (for example a PR/pull-request
+    number, employee id, invoice id, message id, order id, account, repo, env, or
+    ref), an earlier recon step must surface that id from a real response. Later
+    pivot and exploit steps must use the observed id verbatim. Do NOT invent a
+    placeholder id like PR #847, and do NOT borrow object ids from other chains.
   - If a step consumes an uploaded file reference, its `must_provide` and
     `success_criterion` must include explicit use of the prior `upload_id` and
     filename/path as tool parameters or input values, not a shell command that

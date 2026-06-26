@@ -268,8 +268,8 @@ class AgentBreakerChains(AgentBreaker):
         re.IGNORECASE,
     )
     _IDENTITY_USER_NAMED_VALUE_RE = re.compile(
-        r"\b(?:username|user_identifier|user_id|account|subject|email)\b"
-        r"\s*[:=]\s*[\"'`]*([a-z][a-z0-9._@+-]{1,63})\b",
+        r"[\"'`]?\b(username|user_identifier|user_id|account|subject|email)\b"
+        r"[\"'`]?\s*[:=]\s*[\"'`]*([a-z][a-z0-9._@+-]{0,63})\b",
         re.IGNORECASE,
     )
     _IDENTITY_USER_PAREN_USERNAME_RE = re.compile(
@@ -2172,16 +2172,24 @@ class AgentBreakerChains(AgentBreaker):
             return {}
 
         text = str(agent_response or "")
-        candidates: list[str] = []
-        for pattern in (
-            cls._IDENTITY_USER_EMAIL_RE,
-            cls._IDENTITY_USER_NAMED_VALUE_RE,
-            cls._IDENTITY_USER_PAREN_USERNAME_RE,
-        ):
-            candidates.extend(match.group(1) for match in pattern.finditer(text))
+        candidates: list[tuple[str, str]] = []
+        for match in cls._IDENTITY_USER_NAMED_VALUE_RE.finditer(text):
+            key = str(match.group(1) or "").strip().lower()
+            value = str(match.group(2) or "").strip()
+            kind = "email" if key == "email" or "@" in value else "username"
+            candidates.append((kind, value))
+        candidates.extend(
+            ("username", match.group(1))
+            for match in cls._IDENTITY_USER_PAREN_USERNAME_RE.finditer(text)
+        )
+        candidates.extend(
+            ("email", match.group(1))
+            for match in cls._IDENTITY_USER_EMAIL_RE.finditer(text)
+        )
 
         seen: set[str] = set()
-        for raw_value in candidates:
+        candidates.sort(key=lambda item: 1 if item[0] == "email" else 0)
+        for kind, raw_value in candidates:
             value = str(raw_value or "").strip(" \t\r\n'\"`.,;:()[]{}<>")
             value_l = value.lower()
             if not value or value_l in seen:
@@ -2189,7 +2197,7 @@ class AgentBreakerChains(AgentBreaker):
             seen.add(value_l)
             if not cls._identity_user_value_is_safe(value):
                 continue
-            if "@" in value:
+            if kind == "email" or "@" in value:
                 return {"email": value, "user_identifier": value}
             return {"username": value, "user_identifier": value}
         return {}

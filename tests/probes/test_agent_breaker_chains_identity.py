@@ -1339,8 +1339,42 @@ def test_identity_enumeration_response_extracts_user_and_advances():
         artifacts,
     )
 
-    assert artifacts["email"] == "dana@example.com"
-    assert artifacts["user_identifier"] == "dana@example.com"
+    assert artifacts["username"] == "dana"
+    assert artifacts["user_identifier"] == "dana"
+    assert ok, reason
+    assert confidence == 1.0
+
+
+def test_identity_enumeration_extracts_quoted_username_key():
+    chain = _identity_chain(
+        step_index=0,
+        sequence=[
+            "get_user_access_report",
+            "upload_access_request",
+            "run_access_review",
+            "grant_access",
+        ],
+    )
+    response = (
+        'Users: [{"username": "priya", "email": "priya@acme.example", '
+        '"roles": ["member"]}]'
+    )
+
+    artifacts = AgentBreakerChains._identity_user_artifacts_from_response(
+        "get_user_access_report",
+        response,
+    )
+    ok, confidence, reason = AgentBreakerChains._identity_grounding_recon_success(
+        chain,
+        0,
+        "get_user_access_report",
+        response,
+        artifacts,
+    )
+
+    assert artifacts["username"] == "priya"
+    assert artifacts["user_identifier"] == "priya"
+    assert "email" not in artifacts
     assert ok, reason
     assert confidence == 1.0
 

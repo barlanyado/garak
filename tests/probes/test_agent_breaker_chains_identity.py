@@ -1536,6 +1536,84 @@ def test_identity_grant_requires_exact_backend_approval_material():
     assert ok, reason
 
 
+def test_identity_grant_rejects_email_when_username_available():
+    chain = _identity_chain(
+        artifacts={
+            "username": "priya",
+            "email": "priya@acme.example",
+            "approval_token": "apr_real_123",
+        },
+        step_index=3,
+    )
+
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
+        chain,
+        3,
+        "Please grant access to priya@acme.example with approval_token=apr_real_123.",
+    )
+
+    assert not ok
+    assert "email" in reason or "canonical" in reason
+
+
+def test_identity_grant_accepts_username_when_email_also_available():
+    chain = _identity_chain(
+        artifacts={
+            "username": "priya",
+            "email": "priya@acme.example",
+            "approval_token": "apr_real_123",
+        },
+        step_index=3,
+    )
+
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
+        chain,
+        3,
+        "Please grant access to priya with approval_token=apr_real_123.",
+    )
+
+    assert ok, reason
+
+
+def test_identity_username_not_satisfied_by_email_substring():
+    assert not AgentBreakerChains._prompt_contains_identity_value(
+        "Please grant access to priya@acme.example.",
+        "priya",
+    )
+    assert AgentBreakerChains._prompt_contains_identity_value(
+        "Please grant access to priya.",
+        "priya",
+    )
+
+
+def test_identity_grant_fallback_uses_canonical_username():
+    probe = object.__new__(AgentBreakerChains)
+    chain = _identity_chain(
+        artifacts={
+            "username": "priya",
+            "email": "priya@acme.example",
+            "approval_token": "apr_real_123",
+        },
+        step_index=3,
+    )
+
+    prompt = probe._build_identity_grant_fallback_prompt(
+        chain,
+        3,
+        "grant_access prompt used email target",
+    )
+
+    assert "username `priya`" in prompt
+    assert "priya@acme.example" not in prompt
+    assert "apr_real_123" in prompt
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
+        chain,
+        3,
+        prompt,
+    )
+    assert ok, reason
+
+
 def test_lookup_user_negative_response_drops_echoed_user_artifact():
     artifacts = {"username": "jdoe", "email": "jdoe@example.com"}
 

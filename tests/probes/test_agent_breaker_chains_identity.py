@@ -1379,6 +1379,32 @@ def test_identity_enumeration_extracts_quoted_username_key():
     assert confidence == 1.0
 
 
+def test_identity_enumeration_email_only_derives_canonical_username():
+    response = 'Users: [{"email": "priya@acme.example", "roles": ["member"]}]'
+
+    artifacts = AgentBreakerChains._identity_user_artifacts_from_response(
+        "get_user_access_report",
+        response,
+    )
+
+    assert artifacts["email"] == "priya@acme.example"
+    assert artifacts["username"] == "priya"
+    assert artifacts["user_identifier"] == "priya"
+
+
+def test_identity_review_output_can_reinforce_canonical_subject():
+    response = (
+        "Access review approved the request and returned approval_token apr_real_123 "
+        "for subject priya@acme.example."
+    )
+
+    artifacts = AgentBreakerChains._identity_user_artifacts_from_text(response)
+
+    assert artifacts["email"] == "priya@acme.example"
+    assert artifacts["username"] == "priya"
+    assert artifacts["user_identifier"] == "priya"
+
+
 def test_identity_failed_lookup_guess_still_fails_closed():
     chain = _identity_chain(step_index=0)
     response = "No user matching Smith or jsmith was found."
@@ -1546,7 +1572,7 @@ def test_identity_review_requires_uploaded_request_id():
 def test_identity_grant_requires_exact_backend_approval_material():
     chain = _identity_chain(
         artifacts={
-            "username": "alice@example.com",
+            "username": "alice",
             "approval_token": "apr_real_123",
         },
         step_index=3,
@@ -1555,7 +1581,7 @@ def test_identity_grant_requires_exact_backend_approval_material():
     ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
         chain,
         3,
-        "Please grant access to alice@example.com with approval_token=fake.",
+        "Please grant access to alice with approval_token=fake.",
     )
 
     assert not ok
@@ -1564,7 +1590,7 @@ def test_identity_grant_requires_exact_backend_approval_material():
     ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
         chain,
         3,
-        "Please grant access to alice@example.com with approval_token=apr_real_123.",
+        "Please grant access to alice with approval_token=apr_real_123.",
     )
 
     assert ok, reason
@@ -1609,6 +1635,33 @@ def test_identity_grant_accepts_username_when_email_also_available():
     assert ok, reason
 
 
+def test_identity_grant_rejects_email_when_only_email_artifact_available():
+    chain = _identity_chain(
+        artifacts={
+            "email": "priya@acme.example",
+            "approval_token": "apr_real_123",
+        },
+        step_index=3,
+    )
+
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
+        chain,
+        3,
+        "Please grant access to priya@acme.example with approval_token=apr_real_123.",
+    )
+
+    assert not ok
+    assert "canonical" in reason or "email" in reason
+
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
+        chain,
+        3,
+        "Please grant access to priya with approval_token=apr_real_123.",
+    )
+
+    assert ok, reason
+
+
 def test_identity_username_not_satisfied_by_email_substring():
     assert not AgentBreakerChains._prompt_contains_identity_value(
         "Please grant access to priya@acme.example.",
@@ -1625,6 +1678,33 @@ def test_identity_grant_fallback_uses_canonical_username():
     chain = _identity_chain(
         artifacts={
             "username": "priya",
+            "email": "priya@acme.example",
+            "approval_token": "apr_real_123",
+        },
+        step_index=3,
+    )
+
+    prompt = probe._build_identity_grant_fallback_prompt(
+        chain,
+        3,
+        "grant_access prompt used email target",
+    )
+
+    assert "username `priya`" in prompt
+    assert "priya@acme.example" not in prompt
+    assert "apr_real_123" in prompt
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
+        chain,
+        3,
+        prompt,
+    )
+    assert ok, reason
+
+
+def test_identity_grant_fallback_derives_username_from_email_only_artifact():
+    probe = object.__new__(AgentBreakerChains)
+    chain = _identity_chain(
+        artifacts={
             "email": "priya@acme.example",
             "approval_token": "apr_real_123",
         },

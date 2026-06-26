@@ -211,6 +211,7 @@ class AgentBreakerChains(AgentBreaker):
         "member",
         "members",
         "roles",
+        "subject",
         "username",
         "user id",
         "user_id",
@@ -2161,13 +2162,19 @@ class AgentBreakerChains(AgentBreaker):
         return bool(text and cls._IDENTITY_USER_VALUE_RE.fullmatch(text))
 
     @classmethod
-    def _identity_user_artifacts_from_response(
-        cls, tool_name: str, agent_response: object
-    ) -> dict:
-        """Deterministically extract one safe user from identity recon output."""
-        tool_l = str(tool_name or "").strip().lower()
-        if tool_l not in cls._IDENTITY_GROUNDING_RECON_TOOLS:
-            return {}
+    def _identity_username_from_email_value(cls, value: object) -> str:
+        """Return the canonical username implied by a safe email value."""
+        text = str(value or "").strip()
+        if "@" not in text or not cls._identity_user_value_is_safe(text):
+            return ""
+        username = text.split("@", 1)[0].strip()
+        if not username or "@" in username:
+            return ""
+        return username if cls._identity_user_value_is_safe(username) else ""
+
+    @classmethod
+    def _identity_user_artifacts_from_text(cls, agent_response: object) -> dict:
+        """Deterministically extract one safe user from trusted identity output."""
         if not cls._response_has_identity_user_marker(agent_response):
             return {}
 
@@ -2198,9 +2205,26 @@ class AgentBreakerChains(AgentBreaker):
             if not cls._identity_user_value_is_safe(value):
                 continue
             if kind == "email" or "@" in value:
-                return {"email": value, "user_identifier": value}
+                username = cls._identity_username_from_email_value(value)
+                artifacts = {"email": value}
+                if username:
+                    artifacts["username"] = username
+                    artifacts["user_identifier"] = username
+                else:
+                    artifacts["user_identifier"] = value
+                return artifacts
             return {"username": value, "user_identifier": value}
         return {}
+
+    @classmethod
+    def _identity_user_artifacts_from_response(
+        cls, tool_name: str, agent_response: object
+    ) -> dict:
+        """Deterministically extract one safe user from identity recon output."""
+        tool_l = str(tool_name or "").strip().lower()
+        if tool_l not in cls._IDENTITY_GROUNDING_RECON_TOOLS:
+            return {}
+        return cls._identity_user_artifacts_from_text(agent_response)
 
     @classmethod
     def _identity_grounding_recon_success(
@@ -2646,6 +2670,12 @@ class AgentBreakerChains(AgentBreaker):
         ):
             if cls._identity_user_value_is_safe(value) and "@" not in str(value):
                 return str(value).strip()
+        for value in cls._artifact_values_for_aliases(
+            artifacts, cls._IDENTITY_USER_ARTIFACT_KEYS
+        ):
+            username = cls._identity_username_from_email_value(value)
+            if username:
+                return username
         return ""
 
     @classmethod
@@ -3187,6 +3217,9 @@ class AgentBreakerChains(AgentBreaker):
     def _grounded_identity_user_from_artifacts(cls, artifacts: dict) -> str:
         """Return the preferred safe user value from chain-local artifacts."""
         artifacts = artifacts or {}
+        canonical_username = cls._canonical_identity_username_from_artifacts(artifacts)
+        if canonical_username:
+            return canonical_username
         for key in ("username", "user", "subject", "user_identifier", "email"):
             value = str(artifacts.get(key, "") or "").strip()
             if cls._identity_user_value_is_safe(value):
@@ -3672,6 +3705,13 @@ class AgentBreakerChains(AgentBreaker):
             tool_name, agent_response
         ).items():
             flat.setdefault(key, value)
+        if tool_name == "run_access_review" and self._response_has_identity_approval_marker(
+            agent_response
+        ):
+            for key, value in self._identity_user_artifacts_from_text(
+                agent_response
+            ).items():
+                flat.setdefault(key, value)
 
         primary_object = parsed.get("primary_object") or {}
         if isinstance(primary_object, dict) and primary_object.get("id"):

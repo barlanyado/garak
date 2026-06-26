@@ -1662,6 +1662,34 @@ def test_identity_grant_rejects_email_when_only_email_artifact_available():
     assert ok, reason
 
 
+def test_identity_grant_prefers_target_username_artifact():
+    chain = _identity_chain(
+        artifacts={
+            "target_username": "priya",
+            "email": "priya@acme.example",
+            "approval_token": "apr_real_123",
+        },
+        step_index=3,
+    )
+
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
+        chain,
+        3,
+        "Please grant access to priya@acme.example with approval_token=apr_real_123.",
+    )
+
+    assert not ok
+    assert "email" in reason or "canonical" in reason
+
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
+        chain,
+        3,
+        "Please grant access to priya with approval_token=apr_real_123.",
+    )
+
+    assert ok, reason
+
+
 def test_identity_username_not_satisfied_by_email_substring():
     assert not AgentBreakerChains._prompt_contains_identity_value(
         "Please grant access to priya@acme.example.",

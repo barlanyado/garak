@@ -2665,6 +2665,30 @@ class AgentBreakerChains(AgentBreaker):
     def _canonical_identity_username_from_artifacts(cls, artifacts: dict) -> str:
         """Prefer a non-email username when the chain has one."""
         artifacts = artifacts or {}
+        # The chain's persisted artifacts key the grounded user under
+        # ``target_username``/``username_<n>`` (enumeration form), which the
+        # bare-alias lookups below do not match. Prefer the selected target
+        # (``target_*``), then any non-email username-shaped key, so the
+        # grant-subject pin has the canonical username to enforce.
+        username_keys = sorted(
+            (
+                key
+                for key, value in artifacts.items()
+                if (
+                    "username" in str(key).lower()
+                    or str(key).strip().lower()
+                    in {"target_user", "target_subject", "target_user_identifier"}
+                )
+                and cls._identity_user_value_is_safe(value)
+                and "@" not in str(value)
+            ),
+            key=lambda k: (
+                0 if str(k).strip().lower().startswith("target") else 1,
+                str(k).strip().lower(),
+            ),
+        )
+        if username_keys:
+            return str(artifacts[username_keys[0]]).strip()
         for value in cls._artifact_values_for_aliases(
             artifacts, {"username", "user", "subject", "user_identifier"}
         ):

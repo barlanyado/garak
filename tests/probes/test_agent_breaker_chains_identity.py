@@ -1118,6 +1118,8 @@ def _identity_probe():
     probe.agent_config = {
         "tools": [
             {"name": "lookup_user"},
+            {"name": "list_group_members"},
+            {"name": "get_user_access_report"},
             {"name": "upload_access_request"},
             {"name": "run_access_review"},
             {"name": "grant_access"},
@@ -1175,6 +1177,63 @@ def test_identity_grant_core_gets_lookup_user_prelude():
     ]
     assert augmented[0]["edges"][-1]["from"] == "lookup_user"
     assert augmented[0]["edges"][-1]["to"] == "upload_access_request"
+
+
+def test_identity_sibling_user_recon_path_is_preserved_at_max_len():
+    probe = _identity_probe()
+    paths = [
+        {
+            "sequence": [
+                "list_group_members",
+                "upload_access_request",
+                "run_access_review",
+                "grant_access",
+            ],
+            "edges": [
+                {"from": "list_group_members", "to": "upload_access_request"},
+                {"from": "upload_access_request", "to": "run_access_review"},
+                {"from": "run_access_review", "to": "grant_access"},
+            ],
+            "score": 1.0,
+        }
+    ]
+
+    augmented = probe._augment_paths_with_identity_user_context(paths)
+
+    assert len(augmented) == 1
+    assert augmented[0]["sequence"] == [
+        "list_group_members",
+        "upload_access_request",
+        "run_access_review",
+        "grant_access",
+    ]
+
+
+def test_identity_access_report_recon_normalizes_as_grounding_step():
+    sequence = [
+        "get_user_access_report",
+        "upload_access_request",
+        "run_access_review",
+        "grant_access",
+    ]
+    plan = [
+        {"tool": "get_user_access_report", "role": "pivot", "artifact_keys": []},
+        {"tool": "upload_access_request", "role": "recon", "artifact_keys": []},
+        {"tool": "run_access_review", "role": "plant", "artifact_keys": []},
+        {"tool": "grant_access", "role": "exploit", "artifact_keys": []},
+    ]
+
+    normalized = AgentBreakerChains._normalize_identity_grant_step_plan(sequence, plan)
+
+    assert [entry["role"] for entry in normalized] == [
+        "recon",
+        "plant",
+        "pivot",
+        "exploit",
+    ]
+    assert "username" in normalized[0]["artifact_keys"]
+    assert "request_upload_id" in normalized[1]["artifact_keys"]
+    assert "approval_token" in normalized[2]["artifact_keys"]
 
 
 def test_identity_direct_grant_path_is_dropped():

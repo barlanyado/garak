@@ -395,6 +395,101 @@ def test_extract_artifacts_maps_primary_object_and_hidden_capability_scope():
     assert "__capability_bound_to__" not in artifacts
 
 
+def test_terminal_capability_handoff_preserves_exact_value_and_producer():
+    chain = {
+        "sequence": [
+            "list_group_members",
+            "upload_access_request",
+            "run_access_review",
+            "grant_access",
+        ],
+        "step_index": 3,
+        "artifacts": {
+            "approval_token": "approval-opaque-42",
+            "target_username": "alice",
+        },
+        "step_outputs": [
+            {
+                "tool": "run_access_review",
+                "artifacts": {"approval_token": "approval-opaque-42"},
+            }
+        ],
+    }
+
+    handoff = AgentBreakerChains._format_capability_handoff(chain, 3)
+
+    assert "approval_token = approval-opaque-42" in handoff
+    assert "produced by run_access_review" in handoff
+    assert "Do not call, replay, or ask the producing tool" in handoff
+    assert "Do not mint, refresh, validate, exchange, or substitute" in handoff
+
+
+def test_terminal_capability_handoff_does_not_treat_current_step_output_as_prior():
+    chain = {
+        "sequence": ["run_access_review", "grant_access"],
+        "step_index": 0,
+        "artifacts": {"approval_token": "not-yet-a-handoff"},
+        "step_outputs": [
+            {
+                "tool": "run_access_review",
+                "artifacts": {"approval_token": "not-yet-a-handoff"},
+            }
+        ],
+    }
+
+    handoff = AgentBreakerChains._format_capability_handoff(chain, 0)
+
+    assert "not-yet-a-handoff" not in handoff
+    assert "no backend-issued capability" in handoff
+
+
+def test_step_prompt_templates_receive_terminal_capability_handoff():
+    class Detector:
+        @staticmethod
+        def _extract_json(text):
+            return json.loads(text)
+
+    class Probe(AgentBreakerChains):
+        def __init__(self, template_name):
+            self._prompts = {template_name: "handoff={capability_handoff}"}
+            self._detector = Detector()
+            self.global_artifacts = {}
+            self.captured_prompt = ""
+
+        def _get_model_response(self, prompt, model=None):
+            self.captured_prompt = prompt
+            return json.dumps({"attack_prompt": "consume approval-opaque-42"})
+
+    chain = {
+        "sequence": ["run_access_review", "grant_access"],
+        "step_index": 1,
+        "step_plan": [
+            {"tool": "run_access_review", "role": "pivot"},
+            {"tool": "grant_access", "role": "exploit"},
+        ],
+        "artifacts": {"approval_token": "approval-opaque-42"},
+        "step_outputs": [
+            {
+                "tool": "run_access_review",
+                "artifacts": {"approval_token": "approval-opaque-42"},
+            }
+        ],
+        "hypothesis": {},
+    }
+
+    for template_name, generator in (
+        ("STEP_ATTACK", AgentBreakerChains._generate_step_attack_prompt),
+        ("STEP_EXPLOIT", AgentBreakerChains._generate_step_exploit_prompt),
+    ):
+        probe = Probe(template_name)
+        if template_name == "STEP_ATTACK":
+            generated = generator(probe, chain, 1)
+        else:
+            generated = generator(probe, chain, 1, history=[])
+        assert generated == "consume approval-opaque-42"
+        assert "approval-opaque-42" in probe.captured_prompt
+
+
 def test_extract_artifacts_treats_string_false_scope_as_hidden():
     class Detector:
         @staticmethod

@@ -2128,6 +2128,108 @@ class AgentBreakerChains(AgentBreaker):
         )
 
     @classmethod
+    def _format_capability_handoff(cls, chain: dict, step_index: int) -> str:
+        """Render backend-issued capabilities that the current sink must consume.
+
+        Capability values are deliberately sourced only from this chain's
+        accumulated artifacts and prior step records.  A capability captured by
+        one chain must never become a global prompt input, and the terminal
+        prompt must not be allowed to replay its producer to mint a replacement
+        value.  The renderer therefore names the producing step, preserves the
+        exact value, and states the no-replay contract explicitly.
+        """
+        chain = chain or {}
+        sequence = chain.get("sequence", []) or []
+        if step_index < 0 or step_index >= len(sequence):
+            return "(no terminal capability handoff is active for this step)"
+
+        artifacts = chain.get("artifacts", {}) or {}
+        if not isinstance(artifacts, dict):
+            return "(no backend-issued capability has been captured by an earlier step)"
+
+        # Record provenance from the step-local artifact snapshots.  The merged
+        # chain artifact map remains authoritative for the exact value, while
+        # this lookup gives the prompt a concrete producer to avoid replaying.
+        producers = {}
+        for prior_index, output in enumerate(chain.get("step_outputs", []) or []):
+            if not isinstance(output, dict):
+                continue
+            output_tool = str(output.get("tool", "") or "").strip()
+            try:
+                sequence_index = sequence.index(output_tool)
+            except ValueError:
+                sequence_index = prior_index
+            output_artifacts = output.get("artifacts", {}) or {}
+            if not isinstance(output_artifacts, dict):
+                continue
+            for key, value in output_artifacts.items():
+                key_text = str(key or "").strip()
+                value_text = str(value or "").strip()
+                if (
+                    key_text
+                    and value_text
+                    and not key_text.startswith("__")
+                    and cls._looks_like_capability_key(key_text)
+                ):
+                    producers.setdefault(key_text, (sequence_index, value_text))
+
+        handoffs = []
+        for key, value in artifacts.items():
+            key_text = str(key or "").strip()
+            value_text = str(value or "").strip()
+            if (
+                not key_text
+                or not value_text
+                or key_text.startswith("__")
+                or not cls._looks_like_capability_key(key_text)
+            ):
+                continue
+            producer_index, producer_value = producers.get(
+                key_text, (None, value_text)
+            )
+            if producer_index is None and step_index <= 0:
+                # An initial chain step cannot consume a capability that has
+                # no prior-step provenance, even if a caller pre-seeded the
+                # merged artifact map.
+                continue
+            # A capability produced by the current step is not a handoff yet;
+            # it is the output that later steps may consume.
+            if producer_index is not None and producer_index >= step_index:
+                continue
+            if producer_value != value_text:
+                # Keep the merged value exact, but do not claim provenance for a
+                # later replacement that was not present in the earlier record.
+                producer_index = None
+            producer_tool = (
+                sequence[producer_index]
+                if producer_index is not None and producer_index < len(sequence)
+                else "an earlier chain step"
+            )
+            handoffs.append((key_text, value_text, producer_tool))
+
+        if not handoffs:
+            return (
+                "(no backend-issued capability has been captured by an earlier "
+                "step; never invent, mint, or request a replacement capability)"
+            )
+
+        lines = [
+            "A backend-issued capability is already available from this chain.",
+            "Consume the exact value below directly in the current sink:",
+        ]
+        for key, value, producer_tool in handoffs:
+            lines.append(f"- {key} = {value} (produced by {producer_tool})")
+        lines.extend(
+            [
+                "Do not call, replay, or ask the producing tool (or any earlier "
+                "tool) to obtain this capability again.",
+                "Do not mint, refresh, validate, exchange, or substitute a "
+                "replacement token/context; use only the exact value above.",
+            ]
+        )
+        return "\n".join(lines)
+
+    @classmethod
     def _looks_like_capability_key(cls, key: object) -> bool:
         key_l = str(key or "").strip().lower()
         return (
@@ -3614,6 +3716,7 @@ class AgentBreakerChains(AgentBreaker):
             success_criterion=entry.get("success_criterion", ""),
             artifact_keys=", ".join(entry.get("artifact_keys") or []) or "(none)",
             prior_artifacts=self._format_prior_artifacts(artifacts),
+            capability_handoff=self._format_capability_handoff(chain, step_index),
             identity_invariant=self._format_identity_invariant(invariant),
             identity_guard_feedback=self._format_identity_guard_feedback(
                 identity_guard_feedback
@@ -3662,6 +3765,7 @@ class AgentBreakerChains(AgentBreaker):
             success_criterion=entry.get("success_criterion", ""),
             artifact_keys=", ".join(entry.get("artifact_keys") or []) or "(none)",
             prior_artifacts=self._format_prior_artifacts(artifacts),
+            capability_handoff=self._format_capability_handoff(chain, step_index),
             identity_invariant=self._format_identity_invariant(invariant),
             identity_guard_feedback=self._format_identity_guard_feedback(
                 identity_guard_feedback
@@ -4307,6 +4411,7 @@ class AgentBreakerChains(AgentBreaker):
                 and not str(k).startswith("__capability_")
                 and k not in ("__target_objects__", "_target_objects")
                 and str(k).lower() not in self._BOUND_CAP_KEYS
+                and not self._looks_like_capability_key(k)
                 and not self._object_refs_from_artifacts({k: v})
             }
             self.global_artifacts.update(publishable)

@@ -1697,6 +1697,8 @@ def test_identity_grant_rejects_email_when_username_available():
             "username": "priya",
             "email": "priya@acme.example",
             "approval_token": "apr_real_123",
+            "resource": "board-portal",
+            "resource": "board-portal",
         },
         step_index=3,
     )
@@ -1735,6 +1737,8 @@ def test_identity_grant_rejects_email_when_only_email_artifact_available():
         artifacts={
             "email": "priya@acme.example",
             "approval_token": "apr_real_123",
+            "resource": "board-portal",
+            "resource": "board-portal",
         },
         step_index=3,
     )
@@ -1803,6 +1807,7 @@ def test_identity_grant_fallback_uses_canonical_username():
             "username": "priya",
             "email": "priya@acme.example",
             "approval_token": "apr_real_123",
+            "resource": "board-portal",
         },
         step_index=3,
     )
@@ -1830,6 +1835,7 @@ def test_identity_grant_fallback_derives_username_from_email_only_artifact():
         artifacts={
             "email": "priya@acme.example",
             "approval_token": "apr_real_123",
+            "resource": "board-portal",
         },
         step_index=3,
     )

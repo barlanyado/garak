@@ -97,13 +97,101 @@ def test_json_rest_deeper(requests_mock):
         ),
     )
     _config.plugins.generators["rest"]["RestGenerator"]["response_json"] = True
-    _config.plugins.generators["rest"]["RestGenerator"][
-        "response_json_field"
-    ] = "$.choices[*].message.content"
+    _config.plugins.generators["rest"]["RestGenerator"]["response_json_field"] = (
+        "$.choices[*].message.content"
+    )
     generator = RestGenerator()
     conv = Conversation([Turn("user", Message("Who is Enabran Tain's son?"))])
     output = generator._call_model(conv)
     assert output == [Message(DEFAULT_TEXT_RESPONSE)]
+
+
+@pytest.mark.usefixtures("set_rest_config")
+def test_json_rest_retains_only_configured_response_metadata(requests_mock):
+    terminal_outcome = {
+        "schema": "ai-sec.terminal-outcome/v1",
+        "kind": "terminal_outcome",
+        "status": "accepted",
+        "operation": "terminal_action",
+        "effect_ref": "sha256:" + "a" * 64,
+        "execution_count": 1,
+        "suppressed_count": 0,
+    }
+    requests_mock.post(
+        DEFAULT_URI,
+        json={
+            "choices": [
+                {"message": {"role": "assistant", "content": DEFAULT_TEXT_RESPONSE}}
+            ],
+            "terminal_outcome": terminal_outcome,
+            "raw_prompt": "must-not-cross-report-boundary",
+            "credentials": {"api_key": "must-not-cross-report-boundary"},
+        },
+    )
+    config = _config.plugins.generators["rest"]["RestGenerator"]
+    config["response_json"] = True
+    config["response_json_field"] = "$.choices[0].message.content"
+    config["response_metadata_json_fields"] = {"terminal_outcome": "$.terminal_outcome"}
+    generator = RestGenerator()
+
+    output = generator._call_model(
+        Conversation([Turn("user", Message("test metadata"))])
+    )
+
+    assert output == [
+        Message(
+            DEFAULT_TEXT_RESPONSE,
+            notes={"response_metadata": {"terminal_outcome": terminal_outcome}},
+        )
+    ]
+    assert "raw_prompt" not in str(output[0].notes)
+    assert "credentials" not in str(output[0].notes)
+
+
+@pytest.mark.usefixtures("set_rest_config")
+def test_json_rest_ignores_missing_optional_response_metadata(requests_mock):
+    requests_mock.post(
+        DEFAULT_URI,
+        json={
+            "choices": [
+                {"message": {"role": "assistant", "content": DEFAULT_TEXT_RESPONSE}}
+            ]
+        },
+    )
+    config = _config.plugins.generators["rest"]["RestGenerator"]
+    config["response_json"] = True
+    config["response_json_field"] = "$.choices[0].message.content"
+    config["response_metadata_json_fields"] = {"terminal_outcome": "$.terminal_outcome"}
+    generator = RestGenerator()
+
+    output = generator._call_model(
+        Conversation([Turn("user", Message("test metadata"))])
+    )
+
+    assert output == [Message(DEFAULT_TEXT_RESPONSE)]
+
+
+@pytest.mark.usefixtures("set_rest_config")
+def test_response_metadata_requires_json_response():
+    _config.plugins.generators["rest"]["RestGenerator"][
+        "response_metadata_json_fields"
+    ] = {"terminal_outcome": "$.terminal_outcome"}
+
+    with pytest.raises(ValueError, match="requires response_json"):
+        RestGenerator()
+
+
+@pytest.mark.usefixtures("set_rest_config")
+def test_response_metadata_config_must_be_mapping():
+    config = _config.plugins.generators["rest"]["RestGenerator"]
+    config["response_json"] = True
+    config["response_json_field"] = "$.choices[0].message.content"
+    config["response_metadata_json_fields"] = ["$.terminal_outcome"]
+
+    # Configurable merges dictionary defaults before RestGenerator validation;
+    # a wrong container type may therefore be rejected by either layer.
+    with pytest.raises((TypeError, ValueError)):
+        RestGenerator()
 
 
 @pytest.mark.usefixtures("set_rest_config")
@@ -220,9 +308,9 @@ def test_rest_ssl_suppression(mocker, requests_mock, verify_ssl):
 
 @pytest.mark.usefixtures("set_rest_config")
 def test_rest_non_latin1():
-    _config.plugins.generators["rest"]["RestGenerator"][
-        "uri"
-    ] = "http://127.0.0.9"  # don't mock
+    _config.plugins.generators["rest"]["RestGenerator"]["uri"] = (
+        "http://127.0.0.9"  # don't mock
+    )
     _config.plugins.generators["rest"]["RestGenerator"]["headers"] = {
         "not_latin1": "😈😈😈"
     }
@@ -302,9 +390,9 @@ def test_rest_mtls_key_without_cert_raises():
 @pytest.mark.usefixtures("set_rest_config")
 def test_rest_mtls_nonexistent_cert_raises():
     """BadGeneratorException when client_cert points to a nonexistent file."""
-    _config.plugins.generators["rest"]["RestGenerator"][
-        "client_cert"
-    ] = "/nonexistent/path.pem"
+    _config.plugins.generators["rest"]["RestGenerator"]["client_cert"] = (
+        "/nonexistent/path.pem"
+    )
     with pytest.raises(GarakException) as exc_info:
         _plugins.load_plugin("generators.rest.RestGenerator", config_root=_config)
     assert "client_cert" in str(exc_info.value)
@@ -404,9 +492,9 @@ def test_rest_mtls_http_uri_raises(tmp_path):
     cert_file.write_text("dummy cert")
 
     _config.plugins.generators["rest"]["RestGenerator"]["client_cert"] = str(cert_file)
-    _config.plugins.generators["rest"]["RestGenerator"][
-        "uri"
-    ] = "http://example.com/api"
+    _config.plugins.generators["rest"]["RestGenerator"]["uri"] = (
+        "http://example.com/api"
+    )
 
     with pytest.raises(GarakException) as exc_info:
         _plugins.load_plugin("generators.rest.RestGenerator", config_root=_config)
@@ -467,8 +555,6 @@ def test_rest_mtls_pickle_roundtrip(real_mtls_cert_files):
     __setstate__  → _mtls_session must be reconstructed (not None)
     reconstructed session must have the mTLS adapter mounted on 'https://'
     """
-    import requests
-
     from garak.generators.rest import _MtlsAdapter
 
     cert_path, key_path = real_mtls_cert_files
@@ -485,18 +571,18 @@ def test_rest_mtls_pickle_roundtrip(real_mtls_cert_files):
 
     # --- pickle (getstate) ---
     state = generator.__getstate__()
-    assert (
-        state["_mtls_session"] is None
-    ), "_mtls_session must be cleared in __getstate__ so it can be pickled"
+    assert state["_mtls_session"] is None, (
+        "_mtls_session must be cleared in __getstate__ so it can be pickled"
+    )
 
     # --- unpickle (setstate) ---
     generator.__setstate__(state)
-    assert (
-        generator._mtls_session is not None
-    ), "_mtls_session must be reconstructed by __setstate__ via _load_unsafe()"
+    assert generator._mtls_session is not None, (
+        "_mtls_session must be reconstructed by __setstate__ via _load_unsafe()"
+    )
 
     # the reconstructed session must have the mTLS adapter on https://
     adapter = generator._mtls_session.get_adapter("https://example.com")
-    assert isinstance(
-        adapter, _MtlsAdapter
-    ), "Reconstructed session must have an _MtlsAdapter mounted on 'https://'"
+    assert isinstance(adapter, _MtlsAdapter), (
+        "Reconstructed session must have an _MtlsAdapter mounted on 'https://'"
+    )

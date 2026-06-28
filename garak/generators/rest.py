@@ -41,6 +41,10 @@ class RestGenerator(Generator):
         "skip_codes": [],
         "response_json": False,
         "response_json_field": None,
+        # Opt-in mapping of report-safe metadata names to JSONPath expressions.
+        # Selected values are copied into ``Message.notes[\"response_metadata\"]``;
+        # every unlisted response field is discarded from message metadata.
+        "response_metadata_json_fields": {},
         "req_template": "$INPUT",
         "request_timeout": 20,
         "proxies": None,
@@ -68,6 +72,7 @@ class RestGenerator(Generator):
         "headers",
         "response_json",
         "response_json_field",
+        "response_metadata_json_fields",
         "req_template_json_object",
         "request_timeout",
         "ratelimit_codes",
@@ -112,6 +117,32 @@ class RestGenerator(Generator):
                 raise ValueError(
                     "RestGenerator response_json is True but response_json_field is an empty string. If the root object is the target object, use a JSONPath."
                 )
+
+        if not isinstance(self.response_metadata_json_fields, dict):
+            raise ValueError("response_metadata_json_fields must be a mapping")
+        if self.response_metadata_json_fields and not self.response_json:
+            raise ValueError(
+                "response_metadata_json_fields requires response_json to be True"
+            )
+        self.response_metadata_json_exprs: dict = {}
+        for metadata_name, metadata_path in self.response_metadata_json_fields.items():
+            if not isinstance(metadata_name, str) or not metadata_name:
+                raise ValueError(
+                    "response_metadata_json_fields keys must be non-empty strings"
+                )
+            if not isinstance(metadata_path, str) or not metadata_path:
+                raise ValueError(
+                    "response_metadata_json_fields values must be non-empty JSONPath strings"
+                )
+            try:
+                self.response_metadata_json_exprs[metadata_name] = jsonpath_ng.parse(
+                    metadata_path
+                )
+            except JsonPathParserError as e:
+                logging.critical(
+                    "Couldn't parse response metadata JSONPath %s", metadata_path
+                )
+                raise e
 
         if self.name is None:
             self.name = self.uri
@@ -209,7 +240,7 @@ class RestGenerator(Generator):
                     ssl_ctx.check_hostname = False
                     ssl_ctx.verify_mode = ssl.CERT_NONE
             # re-read passphrase from env var if cleared or missing
-            # may be lost during pickle roundtrip 
+            # may be lost during pickle roundtrip
             passphrase = self.client_key_passphrase
             if passphrase is None and self.client_key_passphrase_env_var is not None:
                 passphrase = os.getenv(self.client_key_passphrase_env_var)
@@ -254,6 +285,30 @@ class RestGenerator(Generator):
         """JSON escape a string"""
         # trim first & last "
         return json.dumps(text)[1:-1]
+
+    def _extract_response_metadata(self, response_object: object) -> dict:
+        """Select only configured JSON response metadata.
+
+        Missing paths are ignored so an optional control signal cannot turn an
+        otherwise valid model response into a failed generation. Values must be
+        JSON serializable before they may enter ``Message.notes``.
+        """
+        metadata: dict = {}
+        for name, expression in self.response_metadata_json_exprs.items():
+            matches = expression.find(response_object)
+            if not matches:
+                continue
+            value = (
+                matches[0].value if len(matches) == 1 else [m.value for m in matches]
+            )
+            try:
+                metadata[name] = json.loads(json.dumps(value))
+            except (TypeError, ValueError):
+                logging.warning(
+                    "RestGenerator response metadata field %s was not JSON serializable",
+                    name,
+                )
+        return metadata
 
     def _populate_template(
         self, template: str, text: str, json_escape_key: bool = False
@@ -367,19 +422,20 @@ class RestGenerator(Generator):
             return [Message(str(resp.text))]
 
         response_object = json.loads(resp.content)
+        response_metadata = self._extract_response_metadata(response_object)
 
         response = [None]
 
         # if response_json_field starts with a $, treat is as a JSONPath
-        assert (
-            self.response_json
-        ), "response_json must be True at this point; if False, we should have returned already"
-        assert isinstance(
-            self.response_json_field, str
-        ), "response_json_field must be a string"
-        assert (
-            len(self.response_json_field) > 0
-        ), "response_json_field needs to be complete if response_json is true; ValueError should have been raised in constructor"
+        assert self.response_json, (
+            "response_json must be True at this point; if False, we should have returned already"
+        )
+        assert isinstance(self.response_json_field, str), (
+            "response_json_field must be a string"
+        )
+        assert len(self.response_json_field) > 0, (
+            "response_json_field needs to be complete if response_json is true; ValueError should have been raised in constructor"
+        )
         if self.response_json_field[0] != "$":
             if isinstance(response_object, list):
                 response = [item[self.response_json_field] for item in response_object]
@@ -403,7 +459,12 @@ class RestGenerator(Generator):
                 )
                 return [None]
 
-        return [Message(r) for r in response]
+        message_notes = (
+            {"response_metadata": response_metadata} if response_metadata else {}
+        )
+        return [
+            Message(r, notes=json.loads(json.dumps(message_notes))) for r in response
+        ]
 
 
 class _MtlsAdapter(requests.adapters.HTTPAdapter):

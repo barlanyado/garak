@@ -2826,12 +2826,24 @@ class AgentBreakerChains(AgentBreaker):
 
     @classmethod
     def _identity_approval_value_from_artifacts(cls, artifacts: dict) -> str:
-        for value in cls._artifact_values_for_aliases(
-            artifacts or {}, cls._IDENTITY_APPROVAL_ARTIFACT_KEYS
-        ):
-            text = str(value or "").strip()
-            if text:
-                return text
+        # Prefer the opaque token field over generic approval_context/status
+        # fields.  Review responses commonly contain ``approval_context:
+        # issued`` next to the real ``approval_token``; treating the status as
+        # the capability makes the terminal sink refuse a valid chain.
+        priority_keys = (
+            "approval_token",
+            "authorization_token",
+            "grant_token",
+            "approval_context",
+            "auth_context",
+            "authorization_context",
+        )
+        status_values = {"issued", "approved", "success", "true", "false", "pending"}
+        for key in priority_keys:
+            for value in cls._artifact_values_for_aliases(artifacts or {}, {key}):
+                text = str(value or "").strip()
+                if text and text.lower() not in status_values:
+                    return text
         return ""
 
     @classmethod

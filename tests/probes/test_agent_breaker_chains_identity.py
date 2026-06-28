@@ -1857,6 +1857,12 @@ def test_identity_grant_fallback_derives_username_from_email_only_artifact():
     assert ok, reason
 
 
+def test_identity_approval_prefers_opaque_token_over_issued_status():
+    assert AgentBreakerChains._identity_approval_value_from_artifacts(
+        {"approval_context": "issued", "approval_token": "apr_real_123"}
+    ) == "apr_real_123"
+
+
 def test_lookup_user_negative_response_drops_echoed_user_artifact():
     artifacts = {"username": "jdoe", "email": "jdoe@example.com"}
 

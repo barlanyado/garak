@@ -1132,6 +1132,43 @@ def test_terminal_ci_merge_paths_get_visible_pr_context_prelude():
     assert augmented[0]["edges"][-1]["from"] == "list_pull_requests"
 
 
+def test_terminal_ci_merge_paths_get_missing_upload_context():
+    probe = object.__new__(AgentBreakerChains)
+    probe.agent_config = {
+        "tools": [
+            {"name": "list_pull_requests"},
+            {"name": "upload_file"},
+            {"name": "run_ci_command"},
+            {"name": "merge_pr"},
+        ]
+    }
+    probe.max_chain_len = 4
+
+    paths = [
+        {
+            "sequence": ["list_pull_requests", "run_ci_command", "merge_pr"],
+            "edges": [
+                {"from": "list_pull_requests", "to": "run_ci_command"},
+                {"from": "run_ci_command", "to": "merge_pr"},
+            ],
+            "score": 1.0,
+        }
+    ]
+
+    augmented = probe._augment_paths_with_visible_object_context(paths)
+    edge_pairs = {(e["from"], e["to"]) for e in augmented[0]["edges"]}
+
+    assert augmented[0]["sequence"] == [
+        "list_pull_requests",
+        "upload_file",
+        "run_ci_command",
+        "merge_pr",
+    ]
+    assert ("list_pull_requests", "run_ci_command") in edge_pairs
+    assert ("upload_file", "run_ci_command") in edge_pairs
+    assert ("run_ci_command", "merge_pr") in edge_pairs
+
+
 def test_max_length_ci_merge_path_replaces_non_upload_with_visible_pr_context():
     probe = object.__new__(AgentBreakerChains)
     probe.agent_config = {
@@ -1206,6 +1243,36 @@ def test_chain_completion_priority_prefers_upload_and_visible_pr_context():
 
     assert upload_pr_ci > upload_ci
     assert upload_pr_ci > pr_ci
+
+
+def test_pr_ci_merge_step_plan_is_normalized_to_backend_contract():
+    sequence = ["list_pull_requests", "upload_file", "run_ci_command", "merge_pr"]
+    plan = [
+        {"tool": "list_pull_requests", "role": "pivot", "artifact_keys": []},
+        {"tool": "upload_file", "role": "recon", "artifact_keys": []},
+        {
+            "tool": "run_ci_command",
+            "role": "plant",
+            "intent": "run a command",
+            "must_provide": "",
+            "success_criterion": "",
+            "artifact_keys": [],
+        },
+        {"tool": "merge_pr", "role": "pivot", "artifact_keys": []},
+    ]
+
+    normalized = AgentBreakerChains._normalize_pr_ci_merge_step_plan(sequence, plan)
+
+    assert [entry["role"] for entry in normalized] == [
+        "recon",
+        "plant",
+        "pivot",
+        "exploit",
+    ]
+    assert "pr_number" in normalized[0]["artifact_keys"]
+    assert "upload_id" in normalized[1]["artifact_keys"]
+    assert "authorization_context" in normalized[2]["artifact_keys"]
+    assert "merge_token" in normalized[2]["artifact_keys"]
 
 
 def _identity_probe(tools=None):

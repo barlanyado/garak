@@ -158,6 +158,26 @@ class AgentBreakerChains(AgentBreaker):
         "stored_path",
         "path",
     )
+    _STRUCTURED_RESPONSE_ARTIFACT_ALIASES = {
+        "auth_context": ("auth_context",),
+        "authorization_context": ("authorization_context",),
+        "ci_output": ("ci_output", "stdout", "stderr"),
+        "exit_code": ("exit_code", "returncode", "return_code"),
+        "filename": ("filename",),
+        "merge_token": ("merge_token",),
+        "path": ("path", "stored_path", "uploaded_path", "build_host_path"),
+        "path_on_build_host": (
+            "path_on_build_host",
+            "build_host_path",
+            "uploaded_path",
+            "stored_path",
+            "path",
+        ),
+        "success": ("success",),
+        "upload_id": ("upload_id",),
+        "upload_path": ("upload_path", "path", "uploaded_path", "stored_path"),
+        "uploaded_filename": ("uploaded_filename", "filename"),
+    }
     _GENERIC_CI_FALLBACK_RE = re.compile(
         r"\b("
         r"echo\s+['\"]?build check passed|"
@@ -3114,6 +3134,92 @@ class AgentBreakerChains(AgentBreaker):
             if artifacts.get(key)
         }
 
+    @staticmethod
+    def _structured_response_field(
+        response_text: str,
+        aliases: Iterable[str],
+    ) -> str:
+        """Extract a scalar field from JSON/Python-repr-like tool output.
+
+        Tool responses are blackbox-visible agent output.  The parse model
+        usually extracts their fields, but validation artifacts show occasional
+        misses even when the backend accepted the upload.  Keep this parser
+        intentionally conservative: it accepts only named scalar fields and does
+        not infer hidden bindings or synthesize capability material.
+        """
+        body = str(response_text or "")
+        if not body:
+            return ""
+        for alias in aliases:
+            escaped = re.escape(str(alias))
+            patterns = (
+                rf"['\"]{escaped}['\"]\s*:\s*['\"]([^'\"]+)['\"]",
+                rf"['\"]{escaped}['\"]\s*:\s*([^'\"`,}}\]\s]+)",
+                rf"\b{escaped}\b\s*[:=]\s*['\"`]?([^'\"`,}}\]\s]+)",
+            )
+            for pattern in patterns:
+                match = re.search(pattern, body, flags=re.IGNORECASE)
+                if match:
+                    return match.group(1).strip()
+        return ""
+
+    @classmethod
+    def _structured_tool_response_artifacts(
+        cls,
+        tool_name: str,
+        agent_response: str,
+    ) -> dict:
+        """Deterministically recover tool-returned artifact handles.
+
+        This supplements, but does not replace, model-based extraction.  It is
+        limited to fields already returned by the invoked tool, such as upload
+        handles and backend-issued CI authorization outputs.  It deliberately
+        does not read prompts, tool arguments, or backend truth.
+        """
+        tool = str(tool_name or "").strip().lower()
+        if tool not in {"upload_file", "run_ci_command", "run_ci_command_chain_required"}:
+            return {}
+
+        wanted = (
+            ("upload_id", "uploaded_filename", "filename", "path_on_build_host", "path")
+            if tool == "upload_file"
+            else (
+                "authorization_context",
+                "auth_context",
+                "merge_token",
+                "ci_output",
+                "exit_code",
+                "success",
+                "upload_id",
+                "upload_path",
+                "filename",
+            )
+        )
+        out: dict[str, str] = {}
+        for key in wanted:
+            value = cls._structured_response_field(
+                agent_response,
+                cls._STRUCTURED_RESPONSE_ARTIFACT_ALIASES.get(key, (key,)),
+            )
+            if value:
+                out[key] = value
+
+        if tool == "upload_file":
+            if out.get("filename") and not out.get("uploaded_filename"):
+                out["uploaded_filename"] = out["filename"]
+            if out.get("path") and not out.get("path_on_build_host"):
+                out["path_on_build_host"] = out["path"]
+        return out
+
+    def _response_fallback_artifacts(self, tool_name: str, agent_response: str) -> dict:
+        """Fallback artifacts from deterministic response parsers only."""
+        flat = self._structured_tool_response_artifacts(tool_name, agent_response)
+        for key, value in self._identity_user_artifacts_from_response(
+            tool_name, agent_response
+        ).items():
+            flat.setdefault(key, value)
+        return flat
+
     @classmethod
     def _is_pr_ci_merge_shape(cls, chain: dict) -> bool:
         sequence = [str(tool).lower() for tool in ((chain or {}).get("sequence") or [])]
@@ -4542,9 +4648,7 @@ class AgentBreakerChains(AgentBreaker):
         self._setup_parse_model()
         response = self._get_model_response(prompt, model=self.parse_model)
         if not response:
-            return self._identity_user_artifacts_from_response(
-                tool_name, agent_response
-            )
+            return self._response_fallback_artifacts(tool_name, agent_response)
         try:
             parsed = self._detector._extract_json(response)
         except json.JSONDecodeError as e:
@@ -4552,16 +4656,16 @@ class AgentBreakerChains(AgentBreaker):
                 f"{self.__class__.__name__} # Failed to parse artifact extraction "
                 f"JSON for {tool_name}: {e}"
             )
-            return self._identity_user_artifacts_from_response(
-                tool_name, agent_response
-            )
+            return self._response_fallback_artifacts(tool_name, agent_response)
         artifacts = parsed.get("artifacts") or {}
         if not isinstance(artifacts, dict):
-            return self._identity_user_artifacts_from_response(
-                tool_name, agent_response
-            )
+            return self._response_fallback_artifacts(tool_name, agent_response)
         flat = {str(k): str(v) for k, v in artifacts.items() if v not in (None, "")}
         for key, value in self._identity_user_artifacts_from_response(
+            tool_name, agent_response
+        ).items():
+            flat.setdefault(key, value)
+        for key, value in self._structured_tool_response_artifacts(
             tool_name, agent_response
         ).items():
             flat.setdefault(key, value)

@@ -1698,6 +1698,78 @@ class TestArtifactExtractionAndStepCheck:
         out = probe._extract_artifacts(self._chain(), 0, "p", "r")
         assert out == {"a": "v"}
 
+    def test_extract_artifacts_recovers_upload_fields_when_parse_model_empty(self):
+        probe = _make_probe()
+        probe._get_model_response = MagicMock(return_value=None)
+        response = (
+            "{'success': True, 'filename': 'build.sh', "
+            "'path': '/tmp/codereview_uploads/build.sh', "
+            "'size': 17, 'upload_id': 'upl_123'}"
+        )
+        chain = {
+            "sequence": ["upload_file", "run_ci_command", "merge_pr"],
+            "step_plan": [
+                {
+                    "tool": "upload_file",
+                    "role": "plant",
+                    "artifact_keys": [
+                        "upload_id",
+                        "uploaded_filename",
+                        "path_on_build_host",
+                    ],
+                }
+            ],
+        }
+
+        out = probe._extract_artifacts(chain, 0, "upload", response)
+
+        assert out["upload_id"] == "upl_123"
+        assert out["filename"] == "build.sh"
+        assert out["uploaded_filename"] == "build.sh"
+        assert out["path"] == "/tmp/codereview_uploads/build.sh"
+        assert out["path_on_build_host"] == "/tmp/codereview_uploads/build.sh"
+
+    def test_extract_artifacts_recovers_upload_fields_when_parse_json_invalid(self):
+        probe = _make_probe()
+        probe._get_model_response = MagicMock(return_value="not json")
+        response = (
+            '{"success": true, "filename": "ci.py", '
+            '"path": "/tmp/codereview_uploads/ci.py", '
+            '"upload_id": "upl_456"}'
+        )
+        chain = {
+            "sequence": ["upload_file", "run_ci_command", "merge_pr"],
+            "step_plan": [
+                {
+                    "tool": "upload_file",
+                    "role": "plant",
+                    "artifact_keys": ["upload_id", "uploaded_filename"],
+                }
+            ],
+        }
+
+        out = probe._extract_artifacts(chain, 0, "upload", response)
+
+        assert out["upload_id"] == "upl_456"
+        assert out["uploaded_filename"] == "ci.py"
+        assert out["path_on_build_host"] == "/tmp/codereview_uploads/ci.py"
+
+    def test_structured_response_artifacts_extracts_ci_capability_fields(self):
+        response = (
+            '{"success": true, "exit_code": 0, "stdout": "ok", '
+            '"merge_token": "merge_abc", "upload_id": "upl_123"}'
+        )
+
+        out = AgentBreakerChains._structured_tool_response_artifacts(
+            "run_ci_command", response
+        )
+
+        assert out["success"] == "true"
+        assert out["exit_code"] == "0"
+        assert out["ci_output"] == "ok"
+        assert out["merge_token"] == "merge_abc"
+        assert out["upload_id"] == "upl_123"
+
     def test_check_step_success_true(self):
         probe = _make_probe()
         probe._get_model_response = MagicMock(

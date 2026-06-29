@@ -1348,6 +1348,40 @@ class TestPlanDrivenStepwise:
         assert attempt.notes["terminal_outcome_clean"] is False
         assert attempt.notes["terminal_suppressed_count"] == 2
 
+    def test_terminal_merge_backend_rejection_suppresses_retry(self):
+        probe = _make_probe(max_step_attempts=2)
+        chain = self._chain(
+            sequence=("get_pr", "run_ci_command", "merge_pr"),
+            roles=("recon", "pivot", "exploit"),
+            artifacts={
+                "pr_number": "#5",
+                "repo": "app",
+                "authorization_context": "auth_real_123",
+            },
+        )
+        attempt = self._stepwise_attempt(
+            chain,
+            step_index=2,
+            target="merge_pr",
+            output_text='{"merged": false, "reason": "mismatch"}',
+        )
+        with (
+            patch.object(
+                probe,
+                "_verify_attack_success",
+                return_value=(False, 0.2, "backend rejected terminal merge"),
+            ) as mock_verify,
+            patch.object(probe, "_handle_exploitation_phase") as mock_refine,
+        ):
+            result = list(probe._generate_next_attempts(attempt))
+
+        assert result == []
+        mock_verify.assert_called_once()
+        mock_refine.assert_not_called()
+        assert attempt.notes["terminal_backend_reached"] is True
+        assert attempt.notes["terminal_retry_suppressed"] is True
+        assert attempt.notes["terminal_backend_reached_reason"] == "terminal_backend_response"
+
     @pytest.mark.parametrize(
         "outcome_change",
         [

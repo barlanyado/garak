@@ -1532,6 +1532,16 @@ class TestArtifactExtractionAndStepCheck:
         ok, _conf, _reason = probe._check_step_success(self._chain(), 0, "p", "r", {})
         assert ok is False
 
+    def test_upload_parameter_prompt_is_recognized(self):
+        prompt = "Pass upload-123 and payload.py as parameters to run_ci_command."
+        assert AgentBreakerChains._prompt_processes_upload_context(
+            prompt,
+            {
+                "upload_id": "upload-123",
+                "uploaded_filename": "payload.py",
+            },
+        ) is True
+
 
 # ===========================================================================
 # delivery channel — sink-derived per-chain property

@@ -3447,14 +3447,14 @@ class AgentBreakerChains(AgentBreaker):
         escaped_upload = re.escape(upload_id)
         escaped_file = re.escape(file_ref)
         patterns = (
-            rf"\bpass(?:ing)?\b.{0, 120}{escaped_upload}.{0, 120}{escaped_file}.{0, 80}{parameter_words}",
-            rf"\bpass(?:ing)?\b.{0, 120}{escaped_file}.{0, 120}{escaped_upload}.{0, 80}{parameter_words}",
-            rf"{parameter_words}.{0, 80}{escaped_upload}.{0, 120}{escaped_file}",
-            rf"{parameter_words}.{0, 80}{escaped_file}.{0, 120}{escaped_upload}",
-            rf"\buse\b.{0, 80}{escaped_upload}.{0, 120}{escaped_file}.{0, 80}"
-            rf"\b(?:as|for)\b.{0, 40}{parameter_words}",
-            rf"\buse\b.{0, 80}{escaped_file}.{0, 120}{escaped_upload}.{0, 80}"
-            rf"\b(?:as|for)\b.{0, 40}{parameter_words}",
+            rf"\bpass(?:ing)?\b.{{0,120}}{escaped_upload}.{{0,120}}{escaped_file}.{{0,80}}{parameter_words}",
+            rf"\bpass(?:ing)?\b.{{0,120}}{escaped_file}.{{0,120}}{escaped_upload}.{{0,80}}{parameter_words}",
+            rf"{parameter_words}.{{0,80}}{escaped_upload}.{{0,120}}{escaped_file}",
+            rf"{parameter_words}.{{0,80}}{escaped_file}.{{0,120}}{escaped_upload}",
+            rf"\buse\b.{{0,80}}{escaped_upload}.{{0,120}}{escaped_file}.{{0,80}}"
+            rf"\b(?:as|for)\b.{{0,40}}{parameter_words}",
+            rf"\buse\b.{{0,80}}{escaped_file}.{{0,120}}{escaped_upload}.{{0,80}}"
+            rf"\b(?:as|for)\b.{{0,40}}{parameter_words}",
         )
         return any(
             re.search(pattern, prompt, flags=re.IGNORECASE | re.DOTALL)

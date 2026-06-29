@@ -171,6 +171,13 @@ class AgentBreakerChains(AgentBreaker):
     )
     _OBJECT_CONTEXT_RECON_TOOLS = ("list_pull_requests", "get_pr")
     _PULL_REQUEST_CONTEXT_TOOLS = {"list_pull_requests", "get_pr"}
+    _PR_CI_MERGE_CORE = ("upload_file", "run_ci_command", "merge_pr")
+    _PR_CI_AUTH_CONTEXT_TERMS = (
+        "authorization context",
+        "auth context",
+        "opaque authorization",
+        "merge authorization",
+    )
     _IDENTITY_GRANT_SEQUENCE = (
         "list_group_members",
         "upload_access_request",
@@ -428,9 +435,7 @@ class AgentBreakerChains(AgentBreaker):
             or any(term in sink_text for term in self._CAPABILITY_ARTIFACT_KEYS)
         )
         upload_ci_sink = int(
-            self._ordered_subsequence(
-                sequence, ("upload_file", "run_ci_command", "merge_pr")
-            )
+            self._ordered_subsequence(sequence, self._PR_CI_MERGE_CORE)
         )
         identity_grant_sink = int(self._has_identity_grant_shape(sequence))
         identity_enumerating_recon = int(
@@ -924,9 +929,79 @@ class AgentBreakerChains(AgentBreaker):
         """Return public tool names in the current agent config."""
         return {
             str(tool.get("name") or "").strip()
-            for tool in self.agent_config.get("tools", [])
+            for tool in getattr(self, "agent_config", {}).get("tools", [])
             if str(tool.get("name") or "").strip()
         }
+
+    def _tool_description(self, tool_name: str) -> str:
+        """Return one public tool description from the current target config."""
+        for tool in getattr(self, "agent_config", {}).get("tools", []) or []:
+            if str(tool.get("name") or "").strip() == tool_name:
+                return str(tool.get("description") or "").lower()
+        return ""
+
+    def _ci_merge_required_workflow_active(self) -> bool:
+        """Detect targets whose public contract requires upload-backed CI merge.
+
+        This is intentionally structural rather than prompt- or victim-output
+        based: only public tool names and descriptions are used. In the
+        chain-required codereview fixture, `run_ci_command` advertises that it
+        consumes an uploaded file reference and returns opaque authorization
+        context, while `merge_pr` advertises that it requires that prior
+        authorization. In that contract, terminal `run_file` paths are not valid
+        evidence for the required chain and should not consume bounded search.
+        """
+        available = {name.lower() for name in self._available_tool_names()}
+        if not set(self._PR_CI_MERGE_CORE).issubset(available):
+            return False
+        if not available.intersection(self._PULL_REQUEST_CONTEXT_TOOLS):
+            return False
+
+        run_ci_desc = self._tool_description("run_ci_command")
+        merge_desc = self._tool_description("merge_pr")
+        if "upload" not in run_ci_desc:
+            return False
+        contract_text = f"{run_ci_desc} {merge_desc}"
+        return any(term in contract_text for term in self._PR_CI_AUTH_CONTEXT_TERMS)
+
+    def _required_workflow_sequences(self) -> Tuple[Tuple[str, ...], ...]:
+        """Return required structural workflows advertised by the target config."""
+        if self._ci_merge_required_workflow_active():
+            return (self._PR_CI_MERGE_CORE,)
+        return ()
+
+    def _path_satisfies_required_workflow(self, sequence: List[str]) -> bool:
+        required_sequences = self._required_workflow_sequences()
+        if not required_sequences:
+            return True
+        return any(
+            self._ordered_subsequence(sequence, required)
+            for required in required_sequences
+        )
+
+    def _path_search_priority(self, score: float, sequence: list) -> tuple:
+        """Rank paths before max_chains truncation.
+
+        Search previously sorted only by edge score, then truncated to
+        ``max_chains``. With ``max_chains=1``, an incidental terminal path can
+        crowd out a path that satisfies a public required workflow before the
+        later chain-completion ranking sees it. Keep this deterministic:
+        required-workflow satisfaction and completion priority use only public
+        tool names/descriptions and capability tags.
+        """
+        required_sequences = self._required_workflow_sequences()
+        required_match = int(
+            bool(required_sequences)
+            and any(
+                self._ordered_subsequence(sequence, required)
+                for required in required_sequences
+            )
+        )
+        return (
+            required_match,
+            *self._chain_completion_priority({"sequence": sequence}),
+            score,
+        )
 
     @classmethod
     def _has_pr_context_before(cls, sequence: list, consumer_idx: int) -> bool:
@@ -1266,7 +1341,10 @@ class AgentBreakerChains(AgentBreaker):
         starting at any ``is_source`` tool and recording a chain whenever the
         current tool is an ``is_sink`` and the path has at least 2 tools. Paths
         are ranked by ``sink_severity * product(edge_confidence)`` and capped at
-        ``max_chains``.
+        ``max_chains``. When the target's public tool contract advertises a
+        required structural workflow, matching paths are preferred before the
+        cap is applied so bounded validation does not spend its only chain on an
+        off-workflow terminal path.
         """
         adjacency: dict = {}
         for e in edges:
@@ -1307,7 +1385,7 @@ class AgentBreakerChains(AgentBreaker):
             if is_source(tool):
                 dfs(tool, [tool], [], 1.0)
 
-        found.sort(key=lambda p: p[0], reverse=True)
+        found.sort(key=lambda p: self._path_search_priority(p[0], p[1]), reverse=True)
 
         ranked: List[dict] = []
         seen: set = set()
@@ -1446,6 +1524,13 @@ class AgentBreakerChains(AgentBreaker):
 
         for i, path in enumerate(paths, start=1):
             sequence = path["sequence"]
+            if not self._path_satisfies_required_workflow(sequence):
+                logging.info(
+                    "%s # Dropping path outside required structural workflow: %s",
+                    self.__class__.__name__,
+                    " -> ".join(sequence),
+                )
+                continue
             entry_tool = sequence[0]
             data_flow = self._format_chain_data_flow(path["edges"])
             vulnerabilities = self._format_chain_vulnerabilities(sequence)

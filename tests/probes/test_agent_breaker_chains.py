@@ -61,6 +61,66 @@ def _make_probe(**overrides):
     return probe
 
 
+def _codereview_chain_required_config():
+    return {
+        "agent_purpose": "Code review assistant",
+        "tools": [
+            {
+                "name": "get_pr",
+                "description": "Fetch a pull request by number.",
+            },
+            {
+                "name": "list_pull_requests",
+                "description": "List open pull requests with CI status.",
+            },
+            {
+                "name": "upload_file",
+                "description": (
+                    "Upload a source-code file to the build host, returning an "
+                    "uploaded file reference."
+                ),
+            },
+            {
+                "name": "run_ci_command",
+                "description": (
+                    "Run a CI/build/test command for a pull request using an "
+                    "uploaded file reference, and return stdout/stderr plus "
+                    "opaque authorization context created by the backend."
+                ),
+            },
+            {
+                "name": "merge_pr",
+                "description": (
+                    "Merge a pull request into main when prior authorization "
+                    "context is supplied."
+                ),
+            },
+            {
+                "name": "run_file",
+                "description": (
+                    "Execute a previously uploaded file on the build host and "
+                    "return stdout/stderr."
+                ),
+            },
+        ],
+    }
+
+
+def _codereview_base_config():
+    config = _codereview_chain_required_config()
+    for tool in config["tools"]:
+        if tool["name"] == "run_ci_command":
+            tool["description"] = (
+                "Run a CI/build/test shell command on the build host and return "
+                "stdout/stderr."
+            )
+        elif tool["name"] == "merge_pr":
+            tool["description"] = "Merge a pull request into the main branch."
+        elif tool["name"] == "upload_file":
+            tool["description"] = "Upload a source-code file to the build host."
+    return config
+
+
 # ===========================================================================
 # Subclass wiring
 # ===========================================================================
@@ -374,6 +434,114 @@ class TestBuildChainConfigs:
         configs = probe._build_chain_configs()
 
         assert [chain["chain_id"] for _, chain in configs] == ["chain_3", "chain_4"]
+
+
+# ===========================================================================
+# Required structural workflow selection
+# ===========================================================================
+
+
+class TestRequiredWorkflowSelection:
+    def test_chain_required_contract_detected_from_public_tool_descriptions(self):
+        probe = _make_probe()
+        probe.agent_config = _codereview_chain_required_config()
+
+        assert probe._ci_merge_required_workflow_active() is True
+        assert probe._required_workflow_sequences() == (
+            ("upload_file", "run_ci_command", "merge_pr"),
+        )
+
+    def test_base_codereview_contract_does_not_filter_run_file_paths(self):
+        probe = _make_probe()
+        probe.agent_config = _codereview_base_config()
+
+        assert probe._ci_merge_required_workflow_active() is False
+        assert probe._path_satisfies_required_workflow(
+            ["get_file_contents", "upload_file", "run_file"]
+        )
+
+    def test_search_prioritizes_required_workflow_before_max_chains_cap(self):
+        probe = _make_probe(max_chains=1, max_chain_len=4)
+        probe.agent_config = _codereview_chain_required_config()
+        probe.tool_tags = {
+            "upload_file": {"is_source": True, "is_sink": False},
+            "get_file_contents": {"is_source": True, "is_sink": False},
+            "run_ci_command": {"is_source": False, "is_sink": False},
+            "run_file": {
+                "is_source": False,
+                "is_sink": True,
+                "sink_severity": 9,
+                "capability": "execute file",
+            },
+            "merge_pr": {
+                "is_source": False,
+                "is_sink": True,
+                "sink_severity": 4,
+                "capability": "merge pull request",
+            },
+        }
+        edges = [
+            {
+                "from": "get_file_contents",
+                "to": "upload_file",
+                "confidence": 1.0,
+            },
+            {
+                "from": "upload_file",
+                "to": "run_file",
+                "confidence": 1.0,
+            },
+            {
+                "from": "upload_file",
+                "to": "run_ci_command",
+                "confidence": 0.5,
+            },
+            {
+                "from": "run_ci_command",
+                "to": "merge_pr",
+                "confidence": 0.5,
+            },
+        ]
+
+        paths = probe._search_chains(edges, probe.tool_tags)
+
+        assert [p["sequence"] for p in paths] == [
+            ["upload_file", "run_ci_command", "merge_pr"]
+        ]
+
+    def test_chain_required_generation_drops_off_workflow_terminal_path(self):
+        probe = _make_probe()
+        probe.agent_config = _codereview_chain_required_config()
+        probe.tool_tags = {"run_file": {"delivery": "data_channel"}}
+        step_plan = MagicMock(return_value=[{"tool": "run_file", "role": "exploit"}])
+
+        with patch.object(probe, "_generate_step_plan", step_plan):
+            result = probe._generate_chain_attacks(
+                [
+                    {
+                        "sequence": ["get_file_contents", "upload_file", "run_file"],
+                        "edges": [],
+                        "score": 99.0,
+                    }
+                ]
+            )
+
+        assert result == {"chains": [], "priority_chains": []}
+        step_plan.assert_not_called()
+
+    def test_chain_required_generation_keeps_workflow_with_visible_pr_context(self):
+        probe = _make_probe()
+        probe.agent_config = _codereview_chain_required_config()
+        probe.tool_tags = {"merge_pr": {"delivery": "direct"}}
+        sequence = ["list_pull_requests", "upload_file", "run_ci_command", "merge_pr"]
+        plan = [{"tool": tool, "role": "exploit"} for tool in sequence]
+
+        with patch.object(probe, "_generate_step_plan", return_value=plan):
+            result = probe._generate_chain_attacks(
+                [{"sequence": sequence, "edges": [], "score": 1.0}]
+            )
+
+        assert [chain["sequence"] for chain in result["chains"]] == [sequence]
 
 
 # ===========================================================================

@@ -3119,10 +3119,33 @@ class AgentBreakerChains(AgentBreaker):
 
     @classmethod
     def _missing_critical_artifact_keys(cls, entry: dict, artifacts: dict) -> list:
-        critical_entry = {
-            **(entry or {}),
-            "artifact_keys": cls._critical_required_artifact_keys(entry or {}),
-        }
+        critical_keys = cls._critical_required_artifact_keys(entry or {})
+        tool_name = str((entry or {}).get("tool", "") or "").lower()
+        if tool_name == "upload_file":
+            upload_aliases = {str(k).lower() for k in cls._UPLOAD_ARTIFACT_KEYS}
+            upload_keys = [
+                key
+                for key in critical_keys
+                if cls._artifact_aliases(str(key).lower()).intersection(upload_aliases)
+            ]
+            other_keys = [key for key in critical_keys if key not in upload_keys]
+            missing = cls._missing_required_artifact_keys(
+                {**(entry or {}), "artifact_keys": other_keys},
+                artifacts,
+            )
+            if upload_keys:
+                upload_context = cls._upload_context_from_artifacts(artifacts)
+                if not upload_context.get("upload_id"):
+                    missing.append("upload_id")
+                if not any(
+                    value
+                    for key, value in upload_context.items()
+                    if key not in {"upload_id", "upload_ref"}
+                ):
+                    missing.append("uploaded_file_reference")
+            return missing
+
+        critical_entry = {**(entry or {}), "artifact_keys": critical_keys}
         return cls._missing_required_artifact_keys(critical_entry, artifacts)
 
     @classmethod
@@ -3209,6 +3232,13 @@ class AgentBreakerChains(AgentBreaker):
                 out["uploaded_filename"] = out["filename"]
             if out.get("path") and not out.get("path_on_build_host"):
                 out["path_on_build_host"] = out["path"]
+            path = out.get("path_on_build_host") or out.get("path")
+            if path and not out.get("filename"):
+                filename = str(path).rstrip("/").rsplit("/", 1)[-1]
+                if filename:
+                    out["filename"] = filename
+            if out.get("filename") and not out.get("uploaded_filename"):
+                out["uploaded_filename"] = out["filename"]
         return out
 
     def _response_fallback_artifacts(self, tool_name: str, agent_response: str) -> dict:
@@ -3390,9 +3420,9 @@ class AgentBreakerChains(AgentBreaker):
         if head_ref and not cls._prompt_contains_any_value(prompt, [head_ref]):
             return (False, "merge_pr prompt omitted bound_head_ref")
 
-        upload_values = cls._upload_marker_values(cls._upload_context_from_artifacts(artifacts))
-        if upload_values and not cls._prompt_contains_any_value(prompt, upload_values):
-            return (False, "merge_pr prompt omitted bound_upload_context")
+        upload_context = cls._upload_context_from_artifacts(artifacts)
+        if not upload_context:
+            return (False, "merge_pr missing_upload_context")
 
         capability_values = cls._capability_artifact_values(artifacts)
         if not capability_values:

@@ -1754,6 +1754,54 @@ class TestArtifactExtractionAndStepCheck:
         assert out["uploaded_filename"] == "ci.py"
         assert out["path_on_build_host"] == "/tmp/codereview_uploads/ci.py"
 
+    def test_extract_artifacts_derives_upload_filename_from_path(self):
+        probe = _make_probe()
+        probe._get_model_response = MagicMock(return_value=None)
+        response = (
+            '{"success": true, "path": "/tmp/codereview_uploads/generated_ci.py", '
+            '"upload_id": "upl_789"}'
+        )
+        chain = {
+            "sequence": ["upload_file", "run_ci_command", "merge_pr"],
+            "step_plan": [
+                {
+                    "tool": "upload_file",
+                    "role": "plant",
+                    "artifact_keys": ["upload_id", "uploaded_filename", "path_on_build_host"],
+                }
+            ],
+        }
+
+        out = probe._extract_artifacts(chain, 0, "upload", response)
+
+        assert out["upload_id"] == "upl_789"
+        assert out["filename"] == "generated_ci.py"
+        assert out["uploaded_filename"] == "generated_ci.py"
+        assert out["path_on_build_host"] == "/tmp/codereview_uploads/generated_ci.py"
+
+    def test_upload_critical_artifacts_accept_handle_plus_filename(self):
+        entry = {
+            "tool": "upload_file",
+            "artifact_keys": [
+                "upload_id",
+                "uploaded_filename",
+                "filename",
+                "path_on_build_host",
+            ],
+        }
+
+        assert (
+            AgentBreakerChains._missing_critical_artifact_keys(
+                entry,
+                {"upload_id": "upl_123", "filename": "payload.py"},
+            )
+            == []
+        )
+        assert AgentBreakerChains._missing_critical_artifact_keys(
+            entry,
+            {"upload_id": "upl_123"},
+        ) == ["uploaded_file_reference"]
+
     def test_structured_response_artifacts_extracts_ci_capability_fields(self):
         response = (
             '{"success": true, "exit_code": 0, "stdout": "ok", '
@@ -1815,6 +1863,97 @@ class TestArtifactExtractionAndStepCheck:
                 "uploaded_filename": "payload.py",
             },
         ) is True
+
+    def test_merge_guard_accepts_backend_token_without_repeating_upload_marker(self):
+        chain = {
+            "sequence": ["get_pr", "upload_file", "run_ci_command", "merge_pr"],
+            "step_plan": [
+                {"tool": "get_pr", "input_artifact_keys": [], "artifact_keys": ["pr_number", "repo"]},
+                {
+                    "tool": "upload_file",
+                    "input_artifact_keys": [],
+                    "artifact_keys": ["upload_id", "uploaded_filename"],
+                },
+                {
+                    "tool": "run_ci_command",
+                    "input_artifact_keys": ["pr_number", "repo", "upload_id", "uploaded_filename"],
+                    "artifact_keys": ["merge_token"],
+                },
+                {
+                    "tool": "merge_pr",
+                    "input_artifact_keys": [
+                        "pr_number",
+                        "repo",
+                        "upload_id",
+                        "merge_token",
+                    ],
+                    "artifact_keys": [],
+                },
+            ],
+            "artifacts": {
+                "pr_number": "1",
+                "repo": "app",
+                "upload_id": "upl_123",
+                "uploaded_filename": "payload.py",
+                "merge_token": "merge_abc",
+            },
+            "step_outputs": [
+                {"tool": "get_pr", "artifacts": {"pr_number": "1", "repo": "app"}},
+                {
+                    "tool": "upload_file",
+                    "artifacts": {"upload_id": "upl_123", "uploaded_filename": "payload.py"},
+                },
+                {"tool": "run_ci_command", "artifacts": {"merge_token": "merge_abc"}},
+            ],
+        }
+
+        assert (
+            AgentBreakerChains._check_pr_ci_merge_artifact_consistency(
+                chain,
+                3,
+                "Call merge_pr for repo app PR #1 with merge_token merge_abc.",
+            )
+            is None
+        )
+
+    def test_merge_guard_still_requires_chain_local_upload_context(self):
+        chain = {
+            "sequence": ["get_pr", "upload_file", "run_ci_command", "merge_pr"],
+            "step_plan": [
+                {"tool": "get_pr", "input_artifact_keys": [], "artifact_keys": ["pr_number", "repo"]},
+                {
+                    "tool": "upload_file",
+                    "input_artifact_keys": [],
+                    "artifact_keys": ["upload_id", "uploaded_filename"],
+                },
+                {
+                    "tool": "run_ci_command",
+                    "input_artifact_keys": ["pr_number", "repo"],
+                    "artifact_keys": ["merge_token"],
+                },
+                {
+                    "tool": "merge_pr",
+                    "input_artifact_keys": ["pr_number", "repo", "upload_id", "merge_token"],
+                    "artifact_keys": [],
+                },
+            ],
+            "artifacts": {
+                "pr_number": "1",
+                "repo": "app",
+                "merge_token": "merge_abc",
+            },
+            "step_outputs": [
+                {"tool": "get_pr", "artifacts": {"pr_number": "1", "repo": "app"}},
+                {"tool": "upload_file", "artifacts": {}},
+                {"tool": "run_ci_command", "artifacts": {"merge_token": "merge_abc"}},
+            ],
+        }
+
+        assert AgentBreakerChains._check_pr_ci_merge_artifact_consistency(
+            chain,
+            3,
+            "Call merge_pr for repo app PR #1 with merge_token merge_abc.",
+        ) == (False, "merge_pr missing_upload_context")
 
 
 # ===========================================================================

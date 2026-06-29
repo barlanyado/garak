@@ -4900,6 +4900,59 @@ class AgentBreakerChains(AgentBreaker):
         next_attempt.notes.update(self._chain_grouping_notes(chain))
         return next_attempt
 
+    @classmethod
+    def _merge_step_artifacts_preserving_object_context(
+        cls,
+        chain: dict,
+        step_index: int,
+        new_artifacts: Optional[dict],
+    ) -> dict:
+        """Merge step artifacts without letting helper objects replace the target.
+
+        PR-scoped positive-control chains intentionally bind a visible pull
+        request during recon, then upload helper content and run CI for that same
+        PR.  Artifact extraction for helper steps may also describe the uploaded
+        file as a ``primary_object``.  That object is useful as an upload handle,
+        but it must not replace the upstream PR identity that the CI/merge guard
+        requires.
+
+        Keep this generic: once a chain has a pull-request binding, only another
+        PR-context recon step may rebind it.  Later plant/pivot/exploit steps can
+        still add ordinary artifacts, capabilities, and upload handles, but their
+        own primary object metadata does not overwrite the causal target.
+        """
+        merged_artifacts = dict((chain or {}).get("artifacts", {}) or {})
+        incoming = dict(new_artifacts or {})
+        if not incoming:
+            return merged_artifacts
+
+        existing_type = str(merged_artifacts.get("__object_type__", "") or "").lower()
+        existing_id = cls._normalize_object_id(merged_artifacts.get("__object_id__", ""))
+        incoming_type = str(incoming.get("__object_type__", "") or "").lower()
+        incoming_id = cls._normalize_object_id(incoming.get("__object_id__", ""))
+        sequence = [str(tool).lower() for tool in ((chain or {}).get("sequence") or [])]
+        current_tool = sequence[step_index] if 0 <= step_index < len(sequence) else ""
+
+        has_bound_pr = existing_type in {"pull_request", "pr"} and bool(existing_id)
+        incoming_same_pr = (
+            incoming_type in {"pull_request", "pr"}
+            and bool(incoming_id)
+            and incoming_id == existing_id
+        )
+        may_rebind_pr = current_tool in cls._PULL_REQUEST_CONTEXT_TOOLS
+
+        if has_bound_pr and incoming_type and not incoming_same_pr and not may_rebind_pr:
+            incoming = {
+                key: value
+                for key, value in incoming.items()
+                if not str(key).startswith("__object_")
+            }
+            incoming.pop("__object_type__", None)
+            incoming.pop("__object_id__", None)
+
+        merged_artifacts.update(incoming)
+        return merged_artifacts
+
     def _advance_stepwise(
         self,
         state: AttackState,
@@ -4923,8 +4976,9 @@ class AgentBreakerChains(AgentBreaker):
             new_artifacts = self._extract_artifacts(
                 chain, step_index, state.current_attack_prompt, best_response
             )
-        merged_artifacts = dict(chain.get("artifacts", {}) or {})
-        merged_artifacts.update(new_artifacts)
+        merged_artifacts = self._merge_step_artifacts_preserving_object_context(
+            chain, step_index, new_artifacts
+        )
         chain["artifacts"] = merged_artifacts
 
         step_outputs = list(chain.get("step_outputs", []) or [])

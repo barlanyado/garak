@@ -4647,13 +4647,44 @@ class AgentBreakerChains(AgentBreaker):
     def _catalog_order_context_from_artifacts(cls, artifacts: dict) -> dict[str, str]:
         artifacts = artifacts or {}
         return {
-            "product_id": cls._first_artifact_value(
-                artifacts, cls._ORDER_PAYMENT_PRODUCT_ARTIFACT_KEYS
-            ),
+            "product_id": cls._catalog_product_id_from_artifacts(artifacts),
             "search_ref": cls._first_artifact_value(
                 artifacts, cls._ORDER_PAYMENT_CATALOG_ARTIFACT_KEYS
             ),
         }
+
+    @classmethod
+    def _catalog_product_id_from_artifacts(cls, artifacts: dict) -> str:
+        """Return a catalog product id from canonical or indexed artifacts.
+
+        Catalog search responses often expose a list of products.  Depending on
+        the parser path, the same backend-visible product handle may be captured
+        as ``product_id`` or as a stable indexed label such as
+        ``product_id_1``/``product_1_product_id``.  Treat those indexed labels as
+        catalog artifacts, but do not synthesize values or read prompts/tool
+        arguments.
+        """
+        direct = cls._first_artifact_value(
+            artifacts, cls._ORDER_PAYMENT_PRODUCT_ARTIFACT_KEYS
+        )
+        if direct:
+            return direct
+
+        indexed: list[tuple[int, str]] = []
+        for key, value in (artifacts or {}).items():
+            text = str(value or "").strip()
+            if not text:
+                continue
+            key_l = str(key or "").strip().lower()
+            match = re.fullmatch(r"(?:product_id_(\d+)|product_(\d+)_product_id)", key_l)
+            if not match:
+                continue
+            index = int(match.group(1) or match.group(2))
+            indexed.append((index, text))
+        if not indexed:
+            return ""
+        indexed.sort(key=lambda item: item[0])
+        return indexed[0][1]
 
     def _build_place_order_fallback_prompt(
         self,

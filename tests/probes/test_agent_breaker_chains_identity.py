@@ -1704,6 +1704,39 @@ def test_deterministic_place_order_fallback_uses_catalog_context():
     assert ok, reason
 
 
+def test_deterministic_place_order_fallback_uses_indexed_catalog_product():
+    probe = object.__new__(AgentBreakerChains)
+    probe._last_step_target_object = ""
+    probe._last_step_target_ref = ""
+    chain = _catalog_place_order_chain()
+    chain["artifacts"] = {
+        "product_id_2": "P-200",
+        "product_id_1": "P-100",
+        "search_ref": "catalog_ref_fixture",
+    }
+
+    prompt = probe._build_place_order_fallback_prompt(chain, 1, "")
+
+    assert prompt
+    assert "product_id=P-100" in prompt
+    assert "search_ref=catalog_ref_fixture" in prompt
+
+
+def test_catalog_product_context_accepts_product_index_prefix():
+    artifacts = {
+        "product_2_product_id": "P-200",
+        "product_1_product_id": "P-100",
+        "search_ref": "catalog_ref_fixture",
+    }
+
+    context = AgentBreakerChains._catalog_order_context_from_artifacts(artifacts)
+
+    assert context == {
+        "product_id": "P-100",
+        "search_ref": "catalog_ref_fixture",
+    }
+
+
 def test_guarded_prompt_prefers_deterministic_place_order_fallback(monkeypatch):
     probe = object.__new__(AgentBreakerChains)
     probe._last_step_target_object = ""

@@ -3671,11 +3671,15 @@ class AgentBreakerChains(AgentBreaker):
         if not cls._prompt_mentions_pr(prompt, pr_number):
             return (False, "merge_pr prompt omitted bound_pr_context")
 
-        repo = cls._first_artifact_value(artifacts, cls._REPO_CONTEXT_ARTIFACT_KEYS)
+        repo = cls._ci_bound_artifact_value(
+            artifacts, "ci_repo"
+        ) or cls._first_artifact_value(artifacts, cls._REPO_CONTEXT_ARTIFACT_KEYS)
         if repo and not cls._prompt_contains_any_value(prompt, [repo]):
             return (False, "merge_pr prompt omitted bound_repo_context")
 
-        head_ref = cls._first_artifact_value(artifacts, cls._HEAD_CONTEXT_ARTIFACT_KEYS)
+        head_ref = cls._ci_bound_artifact_value(
+            artifacts, "ci_head_ref"
+        ) or cls._first_artifact_value(artifacts, cls._HEAD_CONTEXT_ARTIFACT_KEYS)
         if head_ref and not cls._prompt_contains_any_value(prompt, [head_ref]):
             return (False, "merge_pr prompt omitted bound_head_ref")
 
@@ -4375,6 +4379,10 @@ class AgentBreakerChains(AgentBreaker):
     def _visible_pull_request_id(cls, chain: dict, artifacts: dict) -> str:
         """Return one visible PR id from this chain, or empty when ambiguous."""
         artifacts = artifacts or {}
+        ci_bound = cls._ci_bound_pull_request_id_from_artifacts(artifacts)
+        if ci_bound:
+            return ci_bound
+
         direct = cls._direct_pull_request_id_from_artifacts(artifacts)
         if direct:
             return direct
@@ -4383,6 +4391,26 @@ class AgentBreakerChains(AgentBreaker):
         if len(observed) == 1:
             return next(iter(observed))
         return ""
+
+    @classmethod
+    def _ci_bound_pull_request_id_from_artifacts(cls, artifacts: dict) -> str:
+        """Return the PR id bound by CI output, not broad recon context."""
+        value = cls._ci_bound_artifact_value(artifacts, "ci_pr_number")
+        if not value:
+            return ""
+        refs = cls._extract_object_refs_from_text(
+            f"ci_pr_number: {value}", "pull_request"
+        )
+        if refs:
+            return cls._normalize_object_id(refs[0].get("id"))
+        if re.fullmatch(r"#?\d+", value):
+            return value.lstrip("#")
+        return ""
+
+    @staticmethod
+    def _ci_bound_artifact_value(artifacts: dict, key: str) -> str:
+        """Return a non-empty artifact value only from the CI-bound key."""
+        return str((artifacts or {}).get(key, "") or "").strip()
 
     @classmethod
     def _direct_pull_request_id_from_artifacts(cls, artifacts: dict) -> str:
@@ -4436,6 +4464,9 @@ class AgentBreakerChains(AgentBreaker):
     @classmethod
     def _default_visible_pull_request_id(cls, chain: dict, artifacts: dict) -> str:
         """Pick a deterministic observed PR for generated fallback prompts."""
+        ci_bound = cls._ci_bound_pull_request_id_from_artifacts(artifacts)
+        if ci_bound:
+            return ci_bound
         direct = cls._direct_pull_request_id_from_artifacts(artifacts)
         if direct:
             return direct
@@ -4556,10 +4587,12 @@ class AgentBreakerChains(AgentBreaker):
             return None
         merge_token = chain_produced_capabilities[0]
 
-        repo = self._first_artifact_value(artifacts, self._REPO_CONTEXT_ARTIFACT_KEYS)
-        head_ref = self._first_artifact_value(
-            artifacts, self._HEAD_CONTEXT_ARTIFACT_KEYS
-        )
+        repo = self._ci_bound_artifact_value(
+            artifacts, "ci_repo"
+        ) or self._first_artifact_value(artifacts, self._REPO_CONTEXT_ARTIFACT_KEYS)
+        head_ref = self._ci_bound_artifact_value(
+            artifacts, "ci_head_ref"
+        ) or self._first_artifact_value(artifacts, self._HEAD_CONTEXT_ARTIFACT_KEYS)
         upload_id = str(upload_context.get("upload_id", "") or "").strip()
         upload_ref = str(
             next(

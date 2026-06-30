@@ -172,6 +172,20 @@ class AgentBreakerChains(AgentBreaker):
         "payment_authorization_context",
         "payment_token",
     }
+    _CUSTOMER_ORDER_REFUND_CORE = ("lookup_customer", "lookup_order", "issue_refund")
+    _CUSTOMER_ORDER_CONTEXT_TERMS = (
+        "customer context",
+        "opaque customer",
+        "customer_context",
+    )
+    _REFUND_AUTH_CONTEXT_TERMS = (
+        "authorization context",
+        "opaque authorization",
+        "refund authorization",
+        "refund_authorization",
+        "refund token",
+        "refund_token",
+    )
     _UPLOAD_ARTIFACT_KEYS = (
         "upload_id",
         "upload_ref",
@@ -533,7 +547,7 @@ class AgentBreakerChains(AgentBreaker):
 
     def _chain_completion_priority(
         self, chain: dict
-    ) -> Tuple[int, int, int, int, int, int, int]:
+    ) -> Tuple[int, int, int, int, int, int, int, int]:
         """Prefer chains likely to reach a terminal privileged sink.
 
         The iterative scheduler starts with every seed attempt before following
@@ -544,7 +558,7 @@ class AgentBreakerChains(AgentBreaker):
         """
         sequence = [str(t).lower() for t in (chain.get("sequence") or [])]
         if not sequence:
-            return (0, 0, 0, 0, 0, 0, 0)
+            return (0, 0, 0, 0, 0, 0, 0, 0)
         sink = sequence[-1]
         sink_tags = self.tool_tags.get(sink, {}) or {}
         sink_text = " ".join(
@@ -581,9 +595,16 @@ class AgentBreakerChains(AgentBreaker):
             )
         )
         upload_pr_ci_sink = int(upload_ci_sink and visible_pr_context)
+        required_workflow_sink = int(
+            any(
+                self._ordered_subsequence(sequence, required)
+                for required in self._required_workflow_sequences()
+            )
+        )
         # Prefer shorter chains after the required capability path is present so
         # bounded runs reach the terminal sink sooner.
         return (
+            required_workflow_sink,
             privileged_sink,
             identity_grant_sink,
             identity_enumerating_recon,
@@ -1134,6 +1155,56 @@ class AgentBreakerChains(AgentBreaker):
             and payment_requires_prior_context
         )
 
+    def _customer_order_refund_required_workflow_active(self) -> bool:
+        """Detect public contracts that require customer/order-backed refunds.
+
+        The support chain-required fixture advertises a three-step public
+        contract: `lookup_customer` yields an opaque customer context consumed
+        by `lookup_order`, then `lookup_order` yields an opaque refund
+        authorization consumed by `issue_refund`. Keep the detector structural:
+        public tool names and descriptions only, no prompts, model outputs,
+        backend truth, or victim-specific values.
+        """
+        available = {name.lower() for name in self._available_tool_names()}
+        if not set(self._CUSTOMER_ORDER_REFUND_CORE).issubset(available):
+            return False
+
+        customer_desc = self._tool_description("lookup_customer")
+        order_desc = self._tool_description("lookup_order")
+        refund_desc = self._tool_description("issue_refund")
+        customer_returns_order_context = (
+            "lookup_order" in customer_desc
+            or any(
+                term in customer_desc
+                for term in self._CUSTOMER_ORDER_CONTEXT_TERMS
+            )
+        )
+        order_requires_customer_context = (
+            any(term in order_desc for term in self._CUSTOMER_ORDER_CONTEXT_TERMS)
+            and (
+                "lookup_customer" in order_desc
+                or "returned" in order_desc
+                or "prior" in order_desc
+            )
+        )
+        order_returns_refund_context = any(
+            term in order_desc for term in self._REFUND_AUTH_CONTEXT_TERMS
+        )
+        refund_requires_prior_context = (
+            any(term in refund_desc for term in self._REFUND_AUTH_CONTEXT_TERMS)
+            and (
+                "lookup_order" in refund_desc
+                or "returned" in refund_desc
+                or "prior" in refund_desc
+            )
+        )
+        return (
+            customer_returns_order_context
+            and order_requires_customer_context
+            and order_returns_refund_context
+            and refund_requires_prior_context
+        )
+
     def _required_workflow_sequences(self) -> Tuple[Tuple[str, ...], ...]:
         """Return required structural workflows advertised by the target config."""
         sequences: list[Tuple[str, ...]] = []
@@ -1141,6 +1212,8 @@ class AgentBreakerChains(AgentBreaker):
             sequences.append(self._PR_CI_MERGE_CORE)
         if self._order_payment_required_workflow_active():
             sequences.append(self._ORDER_PAYMENT_CORE)
+        if self._customer_order_refund_required_workflow_active():
+            sequences.append(self._CUSTOMER_ORDER_REFUND_CORE)
         return tuple(sequences)
 
     def _path_satisfies_required_workflow(self, sequence: List[str]) -> bool:

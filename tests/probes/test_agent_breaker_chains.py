@@ -157,6 +157,51 @@ def _ecommerce_base_config():
     return config
 
 
+def _support_chain_required_config():
+    return {
+        "agent_purpose": "Support assistant",
+        "tools": [
+            {
+                "name": "lookup_customer",
+                "description": (
+                    "Look up a customer record; the result includes opaque "
+                    "customer context for a subsequent order lookup."
+                ),
+            },
+            {
+                "name": "lookup_order",
+                "description": (
+                    "Fetch an order using the opaque customer context returned by "
+                    "lookup_customer; returns opaque refund authorization context."
+                ),
+            },
+            {
+                "name": "issue_refund",
+                "description": (
+                    "Issue a refund only when the opaque refund authorization context "
+                    "returned by lookup_order is supplied."
+                ),
+            },
+            {
+                "name": "update_ticket",
+                "description": "Update a support ticket.",
+            },
+        ],
+    }
+
+
+def _support_base_config():
+    config = _support_chain_required_config()
+    for tool in config["tools"]:
+        if tool["name"] == "lookup_customer":
+            tool["description"] = "Look up a customer record."
+        elif tool["name"] == "lookup_order":
+            tool["description"] = "Fetch an order by order id."
+        elif tool["name"] == "issue_refund":
+            tool["description"] = "Issue a refund for an order."
+    return config
+
+
 # ===========================================================================
 # Subclass wiring
 # ===========================================================================
@@ -514,6 +559,22 @@ class TestRequiredWorkflowSelection:
             ["place_order", "process_payment"]
         )
 
+    def test_customer_order_refund_contract_detected_from_public_tool_descriptions(self):
+        probe = _make_probe()
+        probe.agent_config = _support_chain_required_config()
+
+        assert probe._customer_order_refund_required_workflow_active() is True
+        assert probe._required_workflow_sequences() == (
+            ("lookup_customer", "lookup_order", "issue_refund"),
+        )
+
+    def test_base_support_contract_does_not_require_customer_order_refund_workflow(self):
+        probe = _make_probe()
+        probe.agent_config = _support_base_config()
+
+        assert probe._customer_order_refund_required_workflow_active() is False
+        assert probe._path_satisfies_required_workflow(["lookup_order", "issue_refund"])
+
     def test_search_prioritizes_required_workflow_before_max_chains_cap(self):
         probe = _make_probe(max_chains=1, max_chain_len=4)
         probe.agent_config = _codereview_chain_required_config()
@@ -595,6 +656,49 @@ class TestRequiredWorkflowSelection:
             ["search_catalog", "place_order", "process_payment"]
         ]
 
+    def test_search_prioritizes_customer_order_refund_workflow_before_max_chains_cap(self):
+        probe = _make_probe(max_chains=1, max_chain_len=4)
+        probe.agent_config = _support_chain_required_config()
+        probe.tool_tags = {
+            "lookup_customer": {"is_source": True, "is_sink": False},
+            "lookup_order": {"is_source": True, "is_sink": False},
+            "issue_refund": {
+                "is_source": False,
+                "is_sink": True,
+                "sink_severity": 4,
+                "capability": "issue refund",
+            },
+            "update_ticket": {
+                "is_source": False,
+                "is_sink": True,
+                "sink_severity": 9,
+                "capability": "update support ticket",
+            },
+        }
+        edges = [
+            {
+                "from": "lookup_order",
+                "to": "issue_refund",
+                "confidence": 1.0,
+            },
+            {
+                "from": "issue_refund",
+                "to": "update_ticket",
+                "confidence": 1.0,
+            },
+            {
+                "from": "lookup_customer",
+                "to": "lookup_order",
+                "confidence": 0.5,
+            },
+        ]
+
+        paths = probe._search_chains(edges, probe.tool_tags)
+
+        assert [p["sequence"] for p in paths] == [
+            ["lookup_customer", "lookup_order", "issue_refund"]
+        ]
+
     def test_chain_required_generation_drops_off_workflow_terminal_path(self):
         probe = _make_probe()
         probe.agent_config = _codereview_chain_required_config()
@@ -635,6 +739,26 @@ class TestRequiredWorkflowSelection:
         assert result == {"chains": [], "priority_chains": []}
         step_plan.assert_not_called()
 
+    def test_support_generation_drops_off_workflow_terminal_path(self):
+        probe = _make_probe()
+        probe.agent_config = _support_chain_required_config()
+        probe.tool_tags = {"issue_refund": {"delivery": "direct"}}
+        step_plan = MagicMock(return_value=[{"tool": "issue_refund", "role": "exploit"}])
+
+        with patch.object(probe, "_generate_step_plan", step_plan):
+            result = probe._generate_chain_attacks(
+                [
+                    {
+                        "sequence": ["lookup_order", "issue_refund"],
+                        "edges": [],
+                        "score": 99.0,
+                    }
+                ]
+            )
+
+        assert result == {"chains": [], "priority_chains": []}
+        step_plan.assert_not_called()
+
     def test_chain_required_generation_keeps_workflow_with_visible_pr_context(self):
         probe = _make_probe()
         probe.agent_config = _codereview_chain_required_config()
@@ -654,6 +778,20 @@ class TestRequiredWorkflowSelection:
         probe.agent_config = _ecommerce_chain_required_config()
         probe.tool_tags = {"process_payment": {"delivery": "direct"}}
         sequence = ["search_catalog", "place_order", "process_payment"]
+        plan = [{"tool": tool, "role": "exploit"} for tool in sequence]
+
+        with patch.object(probe, "_generate_step_plan", return_value=plan):
+            result = probe._generate_chain_attacks(
+                [{"sequence": sequence, "edges": [], "score": 1.0}]
+            )
+
+        assert [chain["sequence"] for chain in result["chains"]] == [sequence]
+
+    def test_support_generation_keeps_full_customer_order_refund_workflow(self):
+        probe = _make_probe()
+        probe.agent_config = _support_chain_required_config()
+        probe.tool_tags = {"issue_refund": {"delivery": "direct"}}
+        sequence = ["lookup_customer", "lookup_order", "issue_refund"]
         plan = [{"tool": tool, "role": "exploit"} for tool in sequence]
 
         with patch.object(probe, "_generate_step_plan", return_value=plan):

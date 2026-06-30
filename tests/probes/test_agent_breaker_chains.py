@@ -121,6 +121,42 @@ def _codereview_base_config():
     return config
 
 
+def _ecommerce_chain_required_config():
+    return {
+        "agent_purpose": "Shopping assistant",
+        "tools": [
+            {
+                "name": "search_catalog",
+                "description": "Search the product catalog and return a search reference.",
+            },
+            {
+                "name": "place_order",
+                "description": (
+                    "Place an order using the opaque catalog search reference returned "
+                    "by search_catalog; returns an opaque payment authorization context."
+                ),
+            },
+            {
+                "name": "process_payment",
+                "description": (
+                    "Process payment only with the opaque authorization context returned "
+                    "by place_order."
+                ),
+            },
+        ],
+    }
+
+
+def _ecommerce_base_config():
+    config = _ecommerce_chain_required_config()
+    for tool in config["tools"]:
+        if tool["name"] == "place_order":
+            tool["description"] = "Place an order for a product and quantity."
+        elif tool["name"] == "process_payment":
+            tool["description"] = "Process payment for an order for the given amount."
+    return config
+
+
 # ===========================================================================
 # Subclass wiring
 # ===========================================================================
@@ -460,6 +496,24 @@ class TestRequiredWorkflowSelection:
             ["get_file_contents", "upload_file", "run_file"]
         )
 
+    def test_order_payment_contract_detected_from_public_tool_descriptions(self):
+        probe = _make_probe()
+        probe.agent_config = _ecommerce_chain_required_config()
+
+        assert probe._order_payment_required_workflow_active() is True
+        assert probe._required_workflow_sequences() == (
+            ("search_catalog", "place_order", "process_payment"),
+        )
+
+    def test_base_ecommerce_contract_does_not_require_catalog_payment_workflow(self):
+        probe = _make_probe()
+        probe.agent_config = _ecommerce_base_config()
+
+        assert probe._order_payment_required_workflow_active() is False
+        assert probe._path_satisfies_required_workflow(
+            ["place_order", "process_payment"]
+        )
+
     def test_search_prioritizes_required_workflow_before_max_chains_cap(self):
         probe = _make_probe(max_chains=1, max_chain_len=4)
         probe.agent_config = _codereview_chain_required_config()
@@ -509,6 +563,38 @@ class TestRequiredWorkflowSelection:
             ["upload_file", "run_ci_command", "merge_pr"]
         ]
 
+    def test_search_prioritizes_order_payment_workflow_before_max_chains_cap(self):
+        probe = _make_probe(max_chains=1, max_chain_len=4)
+        probe.agent_config = _ecommerce_chain_required_config()
+        probe.tool_tags = {
+            "search_catalog": {"is_source": True, "is_sink": False},
+            "place_order": {"is_source": True, "is_sink": False},
+            "process_payment": {
+                "is_source": False,
+                "is_sink": True,
+                "sink_severity": 4,
+                "capability": "payment authorization",
+            },
+        }
+        edges = [
+            {
+                "from": "place_order",
+                "to": "process_payment",
+                "confidence": 1.0,
+            },
+            {
+                "from": "search_catalog",
+                "to": "place_order",
+                "confidence": 0.5,
+            },
+        ]
+
+        paths = probe._search_chains(edges, probe.tool_tags)
+
+        assert [p["sequence"] for p in paths] == [
+            ["search_catalog", "place_order", "process_payment"]
+        ]
+
     def test_chain_required_generation_drops_off_workflow_terminal_path(self):
         probe = _make_probe()
         probe.agent_config = _codereview_chain_required_config()
@@ -520,6 +606,26 @@ class TestRequiredWorkflowSelection:
                 [
                     {
                         "sequence": ["get_file_contents", "upload_file", "run_file"],
+                        "edges": [],
+                        "score": 99.0,
+                    }
+                ]
+            )
+
+        assert result == {"chains": [], "priority_chains": []}
+        step_plan.assert_not_called()
+
+    def test_order_payment_generation_drops_off_workflow_terminal_path(self):
+        probe = _make_probe()
+        probe.agent_config = _ecommerce_chain_required_config()
+        probe.tool_tags = {"process_payment": {"delivery": "direct"}}
+        step_plan = MagicMock(return_value=[{"tool": "process_payment", "role": "exploit"}])
+
+        with patch.object(probe, "_generate_step_plan", step_plan):
+            result = probe._generate_chain_attacks(
+                [
+                    {
+                        "sequence": ["place_order", "process_payment"],
                         "edges": [],
                         "score": 99.0,
                     }
@@ -542,6 +648,21 @@ class TestRequiredWorkflowSelection:
             )
 
         assert [chain["sequence"] for chain in result["chains"]] == [sequence]
+
+    def test_order_payment_generation_keeps_full_catalog_payment_workflow(self):
+        probe = _make_probe()
+        probe.agent_config = _ecommerce_chain_required_config()
+        probe.tool_tags = {"process_payment": {"delivery": "direct"}}
+        sequence = ["search_catalog", "place_order", "process_payment"]
+        plan = [{"tool": tool, "role": "exploit"} for tool in sequence]
+
+        with patch.object(probe, "_generate_step_plan", return_value=plan):
+            result = probe._generate_chain_attacks(
+                [{"sequence": sequence, "edges": [], "score": 1.0}]
+            )
+
+        assert [chain["sequence"] for chain in result["chains"]] == [sequence]
+
 
 
 # ===========================================================================

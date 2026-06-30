@@ -141,6 +141,20 @@ class AgentBreakerChains(AgentBreaker):
     )
     _ORDER_PAYMENT_ISSUER_TOOLS = {"place_order", "place_order_chain_required"}
     _ORDER_PAYMENT_TERMINAL_TOOLS = {"process_payment", "process_payment_chain_required"}
+    _ORDER_PAYMENT_CORE = ("search_catalog", "place_order", "process_payment")
+    _ORDER_PAYMENT_CATALOG_CONTEXT_TERMS = (
+        "catalog search reference",
+        "opaque catalog",
+        "search reference",
+        "search_ref",
+    )
+    _ORDER_PAYMENT_AUTH_CONTEXT_TERMS = (
+        "authorization context",
+        "opaque authorization",
+        "payment authorization",
+        "payment_token",
+        "payment token",
+    )
     _ORDER_PAYMENT_ARTIFACT_KEYS = {
         "order",
         "order_id",
@@ -530,7 +544,7 @@ class AgentBreakerChains(AgentBreaker):
         """
         sequence = [str(t).lower() for t in (chain.get("sequence") or [])]
         if not sequence:
-            return (0, 0, 0, 0, 0, 0)
+            return (0, 0, 0, 0, 0, 0, 0)
         sink = sequence[-1]
         sink_tags = self.tool_tags.get(sink, {}) or {}
         sink_text = " ".join(
@@ -1075,11 +1089,59 @@ class AgentBreakerChains(AgentBreaker):
         contract_text = f"{run_ci_desc} {merge_desc}"
         return any(term in contract_text for term in self._PR_CI_AUTH_CONTEXT_TERMS)
 
+    def _order_payment_required_workflow_active(self) -> bool:
+        """Detect public contracts that require catalog-backed payment.
+
+        The ecommerce chain-required fixture exposes a three-step public
+        contract: `search_catalog` yields an opaque catalog reference consumed by
+        `place_order`, then `place_order` yields an opaque payment authorization
+        consumed by `process_payment`. If path search is capped at one chain, the
+        shorter `place_order -> process_payment` path can otherwise crowd out
+        the full causal workflow before scoring sees the missing prerequisite.
+        Keep the detector structural: public tool names and descriptions only,
+        no prompts, model outputs, backend truth, or victim-specific values.
+        """
+        available = {name.lower() for name in self._available_tool_names()}
+        if not set(self._ORDER_PAYMENT_CORE).issubset(available):
+            return False
+
+        place_desc = self._tool_description("place_order")
+        payment_desc = self._tool_description("process_payment")
+        place_requires_catalog_context = (
+            "search_catalog" in place_desc
+            or any(
+                term in place_desc
+                for term in self._ORDER_PAYMENT_CATALOG_CONTEXT_TERMS
+            )
+        )
+        place_returns_payment_context = any(
+            term in place_desc for term in self._ORDER_PAYMENT_AUTH_CONTEXT_TERMS
+        )
+        payment_requires_prior_context = (
+            any(
+                term in payment_desc
+                for term in self._ORDER_PAYMENT_AUTH_CONTEXT_TERMS
+            )
+            and (
+                "place_order" in payment_desc
+                or "prior" in payment_desc
+                or "returned" in payment_desc
+            )
+        )
+        return (
+            place_requires_catalog_context
+            and place_returns_payment_context
+            and payment_requires_prior_context
+        )
+
     def _required_workflow_sequences(self) -> Tuple[Tuple[str, ...], ...]:
         """Return required structural workflows advertised by the target config."""
+        sequences: list[Tuple[str, ...]] = []
         if self._ci_merge_required_workflow_active():
-            return (self._PR_CI_MERGE_CORE,)
-        return ()
+            sequences.append(self._PR_CI_MERGE_CORE)
+        if self._order_payment_required_workflow_active():
+            sequences.append(self._ORDER_PAYMENT_CORE)
+        return tuple(sequences)
 
     def _path_satisfies_required_workflow(self, sequence: List[str]) -> bool:
         required_sequences = self._required_workflow_sequences()

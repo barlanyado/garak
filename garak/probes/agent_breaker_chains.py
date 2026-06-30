@@ -3548,6 +3548,20 @@ class AgentBreakerChains(AgentBreaker):
         ]
 
     @classmethod
+    def _merge_token_artifact_values(cls, artifacts: dict) -> list[str]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for key, value in (artifacts or {}).items():
+            if str(key or "").strip().lower() != "merge_token":
+                continue
+            text = str(value or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            values.append(text)
+        return values
+
+    @classmethod
     def _capability_was_produced_before_step(
         cls,
         chain: dict,
@@ -3652,7 +3666,7 @@ class AgentBreakerChains(AgentBreaker):
         if not upload_context:
             return (False, "merge_pr missing_upload_context")
 
-        capability_values = cls._capability_artifact_values(artifacts)
+        capability_values = cls._merge_token_artifact_values(artifacts)
         if not capability_values:
             return (False, "merge_pr missing_backend_capability")
         chain_produced = [
@@ -4518,7 +4532,7 @@ class AgentBreakerChains(AgentBreaker):
 
         chain_produced_capabilities = [
             value
-            for value in self._capability_artifact_values(artifacts)
+            for value in self._merge_token_artifact_values(artifacts)
             if self._capability_was_produced_before_step(chain, step_index, value)
         ]
         if not chain_produced_capabilities:

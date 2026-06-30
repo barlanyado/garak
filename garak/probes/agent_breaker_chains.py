@@ -5369,6 +5369,30 @@ class AgentBreakerChains(AgentBreaker):
                 )
                 return terminal_fallback
 
+        run_ci_fallback = self._build_run_ci_upload_fallback_prompt(
+            chain, step_index, ""
+        )
+        if run_ci_fallback:
+            fallback_ok, _ = self._check_prompt_identity_consistency(
+                chain,
+                step_index,
+                run_ci_fallback,
+                self._last_step_target_object,
+                self._last_step_target_ref,
+            )
+            if fallback_ok:
+                fallback_ok, _ = self._check_prompt_artifact_consistency(
+                    chain, step_index, run_ci_fallback
+                )
+            if fallback_ok:
+                logging.info(
+                    "%s # Using deterministic run_ci_command prompt for chain %s step %s",
+                    self.__class__.__name__,
+                    chain.get("chain_id", "?"),
+                    step_index + 1,
+                )
+                return run_ci_fallback
+
         payment_fallback = self._build_order_payment_fallback_prompt(
             chain, step_index, ""
         )

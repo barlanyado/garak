@@ -1549,6 +1549,30 @@ def test_run_ci_fallback_chooses_observed_pr_from_multi_pr_recon():
     assert ok, reason
 
 
+def test_guarded_prompt_prefers_deterministic_run_ci_fallback(monkeypatch):
+    probe = object.__new__(AgentBreakerChains)
+    probe._last_step_target_object = ""
+    probe._last_step_target_ref = ""
+    chain = _multi_pr_run_ci_chain()
+
+    def fail_if_model_prompt_is_used(*args, **kwargs):
+        raise AssertionError("model prompt generation should not be needed")
+
+    monkeypatch.setattr(
+        probe, "_generate_step_attack_prompt", fail_if_model_prompt_is_used
+    )
+
+    prompt = probe._generate_guarded_step_prompt(chain, 2, history=None)
+
+    assert prompt
+    assert "run_ci_command" in prompt
+    assert "pr_number=5" in prompt
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
+        chain, 2, prompt
+    )
+    assert ok, reason
+
+
 def test_run_ci_selected_pr_is_bound_for_later_merge():
     chain = _multi_pr_run_ci_chain()
     prompt = (

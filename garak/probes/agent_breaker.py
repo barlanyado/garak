@@ -949,6 +949,21 @@ class AgentBreaker(garak.probes.IterativeProbe):
         """Format an attack prompt to explicitly request using a specific tool"""
         return f"Use the {tool_name} tool for helping with the following task:\n{attack_prompt}"
 
+    def _extract_analysis_json(self, analysis: str) -> dict:
+        """Parse analysis JSON after normalising unnecessary apostrophe escapes."""
+        try:
+            return self._detector._extract_json(analysis)
+        except json.JSONDecodeError:
+            normalised = analysis.replace("\\'", "'")
+            if normalised == analysis:
+                raise
+            parsed = self._detector._extract_json(normalised)
+            logging.info(
+                "%s # Normalised JSON-invalid apostrophe escapes in analysis",
+                self.__class__.__name__,
+            )
+            return parsed
+
     def _analyze_attackable_tools(self) -> dict:
         """Use red team model to analyze which tools can be attacked and their weaknesses"""
         agent_purpose = self.agent_config.get("agent_purpose", "Unknown purpose")
@@ -976,7 +991,7 @@ class AgentBreaker(garak.probes.IterativeProbe):
 
         if analysis:
             try:
-                parsed = self._detector._extract_json(analysis)
+                parsed = self._extract_analysis_json(analysis)
                 result["tool_analyses"] = parsed.get("tool_analyses", {})
                 result["priority_targets"] = parsed.get("priority_targets", [])
             except json.JSONDecodeError as e:

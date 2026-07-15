@@ -255,6 +255,12 @@ class OpenAICompatible(Generator):
             garak.exception.GeneratorBackoffTrigger,
         ),
         max_value=70,
+        # jfinal: bound same-route transport retries to initial + at most 2 (max_tries=3).
+        # These exceptions are transport-only (429 / 5xx / timeout / connection) plus
+        # GeneratorBackoffTrigger (malformed API envelope via retry_json). Valid refusals,
+        # invalid-plan content, non-convergence and backend no-land return normally (not
+        # exceptions) and are therefore never retried. No cross-model fallback exists.
+        max_tries=3,
     )
     def _call_model(
         self, prompt: Union[Conversation, List[dict]], generations_this_call: int = 1

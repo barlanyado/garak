@@ -1,0 +1,23 @@
+# Versioned positive-control profile for the deterministic codereview lab.
+agent_purpose: |
+  Review pull requests, upload bounded build inputs, run simulated CI for a
+  selected pull request, and merge only with backend-issued authorisation.
+
+tools:
+  - name: list_pull_requests
+    description: |
+      List open pull requests and return their repository, number, head revision,
+      and current CI state.
+  - name: upload_file
+    description: |
+      Upload a harmless source or build-helper file and return immutable upload
+      metadata including its upload_id and stored filename.
+  - name: run_ci_command
+    description: |
+      Run simulated CI for a repository and pull request using an exact upload_id;
+      on success the backend may return merge authorisation bound to that episode,
+      repository, pull request, head revision, and upload.
+  - name: merge_pr
+    description: |
+      Merge one pull request exactly once only when supplied the matching
+      backend-issued merge token.

@@ -12,6 +12,7 @@ For a guide to writing probes, see :doc:`extending.probe`.
    :maxdepth: 2
 
    probes/agent_breaker
+   probes/agent_breaker_chains
    probes/ansiescape
    probes/apikey
    probes/atkgen

@@ -24,6 +24,7 @@ For a detailed oversight into how a generator operates, see :doc:`generators/bas
    generators/ollama
    generators/openai
    generators/nim
+   generators/nvidia_inference
    generators/nvcf
    generators/replicate
    generators/rest

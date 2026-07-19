@@ -1,0 +1,171 @@
+run:
+  generations: 1
+  seed: 42
+
+plugins:
+  target_type: rest.RestGenerator
+  target_name: codereview-chain-v1
+  probe_spec: agent_breaker_chains.AgentBreakerChains
+  extended_detectors:
+    - agent_breaker_chains.AgentBreakerChainResult
+
+  generators:
+    rest:
+      RestGenerator:
+        uri: http://127.0.0.1:8000/v1/chat/completions
+        headers:
+          Content-Type: application/json
+        req_template_json_object:
+          model: codereview-chain-v1
+          messages:
+            - role: user
+              content: $INPUT
+          stream: false
+        response_json: true
+        response_json_field: $.choices[0].message.content
+        response_metadata_json_fields:
+          terminal_outcome: $.choices[0].message.metadata.terminal_outcome
+        request_timeout: 240
+        max_tokens: 4096
+
+  probes:
+    agent_breaker_chains:
+      AgentBreakerChains:
+        agent_config_file: agent_breaker/codereview_chain_v1.yaml
+        max_chains: 1
+        max_active_chains: 1
+        max_chain_len: 4
+        max_hypotheses_per_chain: 1
+        max_step_attempts: 3
+        behavioral_probe_enabled: false
+        fault_probe_enabled: false
+        strict_stage_outputs: true
+        deterministic_fallbacks_enabled: false
+        stage_trace_path: artifacts/baseline_codereview_hosted_nano/stages.jsonl
+
+        red_team_model_type: nvidia_inference.NVIDIAInferenceHub
+        red_team_model_name: nvidia/nvidia/Nemotron-3-Nano-30B-A3B
+        red_team_model_config:
+          uri: https://inference-api.nvidia.com/v1/
+          provider_role: hosted_baseline
+          max_retries: 2
+
+        parse_model_type: nvidia_inference.NVIDIAInferenceHub
+        parse_model_name: nvidia/nvidia/Nemotron-3-Nano-30B-A3B
+        parse_model_config:
+          uri: https://inference-api.nvidia.com/v1/
+          provider_role: utility_parser
+          temperature: 0.0
+          max_tokens: 4096
+          max_retries: 2
+          extra_params:
+            extra_body:
+              chat_template_kwargs:
+                enable_thinking: false
+
+        stage_model_roles:
+          hosted_baseline:
+            model_type: nvidia_inference.NVIDIAInferenceHub
+            model_name: nvidia/nvidia/Nemotron-3-Nano-30B-A3B
+            model_config:
+              uri: https://inference-api.nvidia.com/v1/
+              max_retries: 2
+          teacher:
+            model_type: nvidia_inference.NVIDIAInferenceHub
+            model_name: nvidia/zai-org/glm-5.2
+            model_config:
+              uri: https://inference-api.nvidia.com/v1/
+              max_retries: 2
+          local_base:
+            model_type: openai.OpenAICompatible
+            model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+            model_config:
+              uri: http://127.0.0.1:8005/v1/
+              suppressed_params:
+                - stop
+          local_adapter:
+            model_type: openai.OpenAICompatible
+            model_name: nemotron-nano-local-adapter
+            model_config:
+              uri: http://127.0.0.1:8001/v1/
+              suppressed_params:
+                - stop
+
+        stage_model_routes:
+          ANALYSIS: hosted_baseline
+          TOOL_TAGGING: hosted_baseline
+          EDGE_SCORE: hosted_baseline
+          EXPLOIT_HYPOTHESES: hosted_baseline
+          STEP_PLAN: hosted_baseline
+          STEP_ATTACK: hosted_baseline
+          STEP_EXPLOIT: hosted_baseline
+
+        stage_generation_settings:
+          ANALYSIS:
+            temperature: 1.0
+            top_p: 1.0
+            max_tokens: 16384
+            extra_params:
+              extra_body:
+                reasoning_budget: 16384
+          TOOL_TAGGING:
+            temperature: 0.0
+            top_p: 1.0
+            max_tokens: 4096
+            extra_params:
+              extra_body:
+                chat_template_kwargs:
+                  enable_thinking: false
+          EDGE_SCORE:
+            temperature: 0.0
+            top_p: 1.0
+            max_tokens: 4096
+            extra_params:
+              extra_body:
+                chat_template_kwargs:
+                  enable_thinking: false
+          EXPLOIT_HYPOTHESES:
+            temperature: 1.0
+            top_p: 1.0
+            max_tokens: 16384
+            extra_params:
+              extra_body:
+                reasoning_budget: 16384
+          STEP_PLAN:
+            temperature: 1.0
+            top_p: 1.0
+            max_tokens: 16384
+            extra_params:
+              extra_body:
+                reasoning_budget: 16384
+          STEP_ATTACK:
+            temperature: 0.0
+            top_p: 1.0
+            max_tokens: 4096
+            extra_params:
+              extra_body:
+                chat_template_kwargs:
+                  enable_thinking: false
+          STEP_EXPLOIT:
+            temperature: 1.0
+            top_p: 1.0
+            max_tokens: 16384
+            extra_params:
+              extra_body:
+                reasoning_budget: 16384
+
+  detectors:
+    agent_breaker_chains:
+      AgentBreakerChainResult:
+        detector_model_type: nvidia_inference.NVIDIAInferenceHub
+        detector_model_name: nvidia/nvidia/Nemotron-3-Nano-30B-A3B
+        detector_model_config:
+          uri: https://inference-api.nvidia.com/v1/
+          provider_role: utility_parser
+          temperature: 0.0
+          max_tokens: 1024
+          max_retries: 2
+          extra_params:
+            extra_body:
+              chat_template_kwargs:
+                enable_thinking: false

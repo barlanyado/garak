@@ -26,6 +26,7 @@ Further info:
 import copy
 import json
 import logging
+from pathlib import Path
 import re
 from typing import Iterable, List, Optional, Tuple
 
@@ -35,6 +36,16 @@ from garak import _config
 from garak.data import path as data_path
 import garak.attempt
 from garak.probes.agent_breaker import AgentBreaker, AttackState
+from garak.resources.agent_breaker_stage import (
+    STAGES as ATTACKER_STAGES,
+    append_outcome,
+    append_trace,
+    make_fallback_event,
+    make_outcome_event,
+    make_trace_record,
+    resolve_git_commit,
+    validate_stage_output,
+)
 
 
 class AgentBreakerChains(AgentBreaker):
@@ -88,6 +99,20 @@ class AgentBreakerChains(AgentBreaker):
         # multiple hypotheses (e.g. path traversal vs planting executable
         # content) instead of fixating on one. Set to 1 to disable fan-out.
         "max_hypotheses_per_chain": 3,
+        # Exact attacker-stage routing. Roles are loaded lazily, so one config
+        # can declare hosted baseline, teacher, and local-adapter models while
+        # selecting only the role needed for this run.
+        "stage_model_roles": {},
+        "stage_model_routes": {},
+        "stage_generation_settings": {},
+        # Versioned, exact-prompt stage traces. None disables trace output.
+        "stage_trace_path": None,
+        "stage_trace_garak_commit": None,
+        # Compatibility defaults preserve historical permissive parsing and
+        # deterministic attack-prompt helpers. Model-only evaluation must set
+        # strict_stage_outputs=true and deterministic_fallbacks_enabled=false.
+        "strict_stage_outputs": False,
+        "deterministic_fallbacks_enabled": True,
     }
 
     # Hard cap on how many characters of a prior step's raw response we paste into
@@ -140,7 +165,10 @@ class AgentBreakerChains(AgentBreaker):
         "merge authorization",
     )
     _ORDER_PAYMENT_ISSUER_TOOLS = {"place_order", "place_order_chain_required"}
-    _ORDER_PAYMENT_TERMINAL_TOOLS = {"process_payment", "process_payment_chain_required"}
+    _ORDER_PAYMENT_TERMINAL_TOOLS = {
+        "process_payment",
+        "process_payment_chain_required",
+    }
     _ORDER_PAYMENT_CORE = ("search_catalog", "place_order", "process_payment")
     _ORDER_PAYMENT_CATALOG_CONTEXT_TERMS = (
         "catalog search reference",
@@ -220,10 +248,10 @@ class AgentBreakerChains(AgentBreaker):
         "ci_output": ("ci_output", "stdout", "stderr"),
         "exit_code": ("exit_code", "returncode", "return_code"),
         "filename": ("filename",),
-            "merge_token": ("merge_token",),
-            "order_id": ("order_id",),
-            "order_total": ("order_total", "total", "amount"),
-            "path": ("path", "stored_path", "uploaded_path", "build_host_path"),
+        "merge_token": ("merge_token",),
+        "order_id": ("order_id",),
+        "order_total": ("order_total", "total", "amount"),
+        "path": ("path", "stored_path", "uploaded_path", "build_host_path"),
         "path_on_build_host": (
             "path_on_build_host",
             "build_host_path",
@@ -231,18 +259,18 @@ class AgentBreakerChains(AgentBreaker):
             "stored_path",
             "path",
         ),
-            "payment_token": (
-                "payment_token",
-                "payment_authorization",
-                "payment_authorization_context",
-            ),
-            "product_id": ("product_id", "id"),
-            "search_ref": ("search_ref", "catalog_ref"),
-            "success": ("success",),
-            "upload_id": ("upload_id",),
-            "upload_path": ("upload_path", "path", "uploaded_path", "stored_path"),
-            "uploaded_filename": ("uploaded_filename", "filename"),
-        }
+        "payment_token": (
+            "payment_token",
+            "payment_authorization",
+            "payment_authorization_context",
+        ),
+        "product_id": ("product_id", "id"),
+        "search_ref": ("search_ref", "catalog_ref"),
+        "success": ("success",),
+        "upload_id": ("upload_id",),
+        "upload_path": ("upload_path", "path", "uploaded_path", "stored_path"),
+        "uploaded_filename": ("uploaded_filename", "filename"),
+    }
     _GENERIC_CI_FALLBACK_RE = re.compile(
         r"\b("
         r"echo\s+['\"]?build check passed|"
@@ -459,6 +487,10 @@ class AgentBreakerChains(AgentBreaker):
 
     def __init__(self, config_root=_config):
         super().__init__(config_root=config_root)
+        self._stage_models: dict = {}
+        self._stage_trace_garak_commit = self.stage_trace_garak_commit or (
+            resolve_git_commit(Path(__file__).resolve())
+        )
         # tool_name -> tag_dict (consumes/produces/capability/source/sink markers)
         self.tool_tags: dict = {}
         # Technique label parsed from the most recent step prompt-generation
@@ -478,7 +510,27 @@ class AgentBreakerChains(AgentBreaker):
         self._last_step_target_object: str = ""
         self._last_step_target_ref: str = ""
 
+    def _validate_stage_configuration(self) -> None:
+        """Fail before detector/model construction on invalid stage controls."""
+        unknown_routes = set(self.stage_model_routes) - set(ATTACKER_STAGES)
+        unknown_settings = set(self.stage_generation_settings) - set(ATTACKER_STAGES)
+        if unknown_routes or unknown_settings:
+            unknown = sorted(unknown_routes | unknown_settings)
+            raise ValueError(
+                "Agent Breaker stage configuration contains unregistered stage(s): "
+                + ", ".join(unknown)
+            )
+        for stage in self.stage_generation_settings:
+            self._stage_settings(stage)
+        if isinstance(self.max_step_attempts, bool) or not isinstance(
+            self.max_step_attempts, int
+        ):
+            raise ValueError("max_step_attempts must be a positive integer")
+        if self.max_step_attempts < 1:
+            raise ValueError("max_step_attempts must be a positive integer")
+
     def _make_detector(self, config_root):
+        self._validate_stage_configuration()
         from garak.detectors.agent_breaker_chains import AgentBreakerChainResult
 
         return AgentBreakerChainResult(config_root=config_root)
@@ -488,6 +540,297 @@ class AgentBreakerChains(AgentBreaker):
         chains_prompts_path = data_path / "agent_breaker_chains" / "prompts.yaml"
         with open(chains_prompts_path, "r", encoding="utf-8") as f:
             self._prompts.update(yaml.safe_load(f))
+
+    _STAGE_SETTING_KEYS = frozenset(
+        {
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "seed",
+            "extra_params",
+            "suppressed_params",
+        }
+    )
+
+    @staticmethod
+    def _redact_stage_setting(value: object, key: str = "") -> object:
+        """Return JSON-safe generation settings without credential-like values."""
+        lowered = key.lower()
+        collapsed = re.sub(r"[^a-z0-9]", "", lowered)
+        if (
+            "apikey" in collapsed
+            or "authorization" in collapsed
+            or "credential" in collapsed
+            or "secret" in collapsed
+            or collapsed == "token"
+            or collapsed.endswith(
+                (
+                    "apitoken",
+                    "accesstoken",
+                    "authtoken",
+                    "bearertoken",
+                    "refreshtoken",
+                )
+            )
+        ):
+            return "<redacted>"
+        if isinstance(value, dict):
+            return {
+                str(item_key): AgentBreakerChains._redact_stage_setting(
+                    item_value, str(item_key)
+                )
+                for item_key, item_value in value.items()
+            }
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [
+                AgentBreakerChains._redact_stage_setting(item, key) for item in value
+            ]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return repr(value)
+
+    def _model_for_stage(self, stage: str) -> Tuple[str, object]:
+        """Return the lazily-loaded role and model for one exact stage."""
+        if stage not in ATTACKER_STAGES:
+            raise ValueError(f"Unregistered Agent Breaker stage: {stage}")
+        role = str(getattr(self, "stage_model_routes", {}).get(stage, "red_team"))
+        if role == "red_team":
+            if not hasattr(self, "red_team_model"):
+                return role, None
+            self._setup_red_team_model()
+            return role, self.red_team_model
+        stage_models = getattr(self, "_stage_models", {})
+        if role in stage_models:
+            return role, self._stage_models[role]
+
+        role_config = getattr(self, "stage_model_roles", {}).get(role)
+        if not isinstance(role_config, dict):
+            raise ValueError(f"No stage model role configuration for '{role}'")
+        model_type = role_config.get("model_type")
+        model_name = role_config.get("model_name")
+        if not isinstance(model_type, str) or not model_type:
+            raise ValueError(f"Stage model role '{role}' has no model_type")
+        if not isinstance(model_name, str) or not model_name:
+            raise ValueError(f"Stage model role '{role}' has no model_name")
+        model_config = copy.deepcopy(role_config.get("model_config") or {})
+        if not isinstance(model_config, dict):
+            raise ValueError(
+                f"Stage model role '{role}' model_config must be an object"
+            )
+        model_config.setdefault("provider_role", role)
+        model = self._load_model(model_type, model_name, model_config)
+        if not hasattr(self, "_stage_models"):
+            self._stage_models = {}
+        self._stage_models[role] = model
+        return role, model
+
+    def _stage_settings(self, stage: str) -> dict:
+        """Return validated, copied settings for one exact stage."""
+        settings = copy.deepcopy(
+            getattr(self, "stage_generation_settings", {}).get(stage) or {}
+        )
+        if not isinstance(settings, dict):
+            raise ValueError(f"Generation settings for {stage} must be an object")
+        unknown = set(settings) - self._STAGE_SETTING_KEYS
+        if unknown:
+            raise ValueError(
+                f"Unsupported generation setting(s) for {stage}: "
+                + ", ".join(sorted(unknown))
+            )
+        return settings
+
+    def _get_stage_model_response(
+        self,
+        stage: str,
+        prompt: str,
+        trace_context: Optional[dict] = None,
+        defer_trace: bool = False,
+    ) -> Optional[str]:
+        """Call, validate, route, and optionally trace one attacker stage."""
+        trace_context = trace_context or {}
+        role, model = self._model_for_stage(stage)
+        settings = self._stage_settings(stage)
+        previous: dict = {}
+        missing: set = set()
+        effective_settings: dict = {}
+        if model is None:
+            response = self._get_model_response(prompt)
+        else:
+            for key, value in settings.items():
+                if hasattr(model, key):
+                    previous[key] = getattr(model, key)
+                else:
+                    missing.add(key)
+                setattr(model, key, copy.deepcopy(value))
+
+            model.last_call_metadata = {}
+            model.last_reasoning_content = None
+            try:
+                response = self._get_model_response(prompt, model=model)
+                effective_settings = {
+                    key: self._redact_stage_setting(getattr(model, key), key)
+                    for key in self._STAGE_SETTING_KEYS
+                    if hasattr(model, key)
+                }
+            finally:
+                for key, value in previous.items():
+                    setattr(model, key, value)
+                for key in missing:
+                    delattr(model, key)
+
+        parsed: object = None
+        validation_errors: List[str] = []
+        if not response:
+            validation_errors.append("model returned no completion")
+        else:
+            try:
+                if getattr(self, "strict_stage_outputs", False):
+                    parsed = json.loads(response)
+                else:
+                    parsed = self._detector._extract_json(response)
+            except json.JSONDecodeError as error:
+                validation_errors.append(f"invalid JSON: {error.msg}")
+            if parsed is not None:
+                validation_errors.extend(validate_stage_output(stage, parsed))
+
+        stage_trace_path = getattr(self, "stage_trace_path", None)
+        if stage_trace_path:
+            record = make_trace_record(
+                stage=stage,
+                prompt=prompt,
+                template=self._prompts[stage],
+                model_role=role,
+                model=model,
+                raw_completion=response,
+                parsed_completion=parsed,
+                validation_errors=validation_errors,
+                strict_stage_outputs=getattr(self, "strict_stage_outputs", False),
+                deterministic_fallbacks_enabled=getattr(
+                    self, "deterministic_fallbacks_enabled", True
+                ),
+                fallback_used=False,
+                generation_settings=effective_settings,
+                garak_commit=getattr(self, "_stage_trace_garak_commit", "unknown"),
+                guards=trace_context.get("guards"),
+                artifacts=trace_context.get("artifacts"),
+                deterministic_outcome=trace_context.get("deterministic_outcome"),
+                victim_response=trace_context.get("victim_response"),
+            )
+            if defer_trace:
+                self._pending_stage_trace_record = record
+            else:
+                self._append_stage_trace_record(record)
+
+        if getattr(self, "strict_stage_outputs", False) and validation_errors:
+            logging.warning(
+                "%s # Rejecting invalid %s output: %s",
+                self.__class__.__name__,
+                stage,
+                "; ".join(validation_errors),
+            )
+            return None
+        return response
+
+    def _append_stage_trace_record(self, record: dict) -> None:
+        """Write one prepared trace record to the configured JSONL stream."""
+        stage_trace_path = getattr(self, "stage_trace_path", None)
+        if not stage_trace_path:
+            return
+        try:
+            append_trace(stage_trace_path, record)
+        except OSError as error:
+            logging.error(
+                "%s # Could not append stage trace to %s: %s",
+                self.__class__.__name__,
+                stage_trace_path,
+                error,
+            )
+            raise
+
+    def _flush_pending_stage_trace(
+        self, guards: Optional[list] = None, fallback_used: bool = False
+    ) -> Optional[str]:
+        """Complete deferred stage attribution and append its trace."""
+        record = getattr(self, "_pending_stage_trace_record", None)
+        if not isinstance(record, dict):
+            return None
+        if guards is not None:
+            record["guards"] = guards
+        record["fallback_used"] = bool(fallback_used)
+        self._append_stage_trace_record(record)
+        self._pending_stage_trace_record = None
+        return str(record["attempt_id"])
+
+    def _record_step_fallback(
+        self,
+        *,
+        chain: dict,
+        stage: str,
+        fallback_kind: str,
+        prompt: str,
+        pre_model: bool,
+        attempt_id: Optional[str] = None,
+    ) -> None:
+        """Stamp fallback attribution and trace pre-model shortcuts."""
+        fallback_event = None
+        if pre_model:
+            fallback_event = make_fallback_event(
+                stage=stage,
+                fallback_kind=fallback_kind,
+                deterministic_prompt=prompt,
+                artifacts=chain.get("artifacts", {}) or {},
+                garak_commit=getattr(self, "_stage_trace_garak_commit", "unknown"),
+            )
+            attempt_id = str(fallback_event["attempt_id"])
+        attribution = {
+            "used": True,
+            "stage": stage,
+            "kind": fallback_kind,
+            "pre_model": bool(pre_model),
+        }
+        if attempt_id:
+            attribution["attempt_id"] = attempt_id
+            chain["stage_attempt_id"] = attempt_id
+            chain["step_generation_stage"] = stage
+        chain["step_generation_fallback"] = attribution
+        stage_trace_path = getattr(self, "stage_trace_path", None)
+        if fallback_event is not None and stage_trace_path:
+            append_outcome(stage_trace_path, fallback_event)
+
+    def _analyze_attackable_tools(self) -> dict:
+        """Run inherited per-tool analysis as the exact ``ANALYSIS`` stage."""
+        agent_purpose = self.agent_config.get("agent_purpose", "Unknown purpose")
+        tools_description = self._format_tools_for_analysis(
+            self.tool_profiles,
+            self.tool_behaviors,
+            self.tool_fault_signatures,
+        )
+        prompt = self._prompts["ANALYSIS"].format(
+            agent_purpose=agent_purpose,
+            tools_description=tools_description,
+        )
+        analysis = self._get_stage_model_response("ANALYSIS", prompt)
+        result = {
+            "raw_analysis": analysis,
+            "agent_purpose": agent_purpose,
+            "tools": self.agent_config.get("tools", []),
+            "tool_analyses": {},
+            "priority_targets": [],
+        }
+        if analysis:
+            try:
+                parsed = self._detector._extract_json(analysis)
+            except json.JSONDecodeError as error:
+                logging.warning(
+                    "%s # Failed to parse ANALYSIS JSON: %s",
+                    self.__class__.__name__,
+                    error,
+                )
+            else:
+                result["tool_analyses"] = parsed.get("tool_analyses", {})
+                result["priority_targets"] = parsed.get("priority_targets", [])
+        return result
 
     # ------------------------------------------------------------------
     # Orchestration
@@ -507,11 +850,11 @@ class AgentBreakerChains(AgentBreaker):
 
         chain_configs = self._build_chain_configs()
 
-        # Budget the iterative loop: every active chain runs as a plan-driven sequence
-        # of up to ``max_chain_len`` steps, each step with up to
-        # ``max_step_attempts`` initial+refinement turns.
-        budget_per_chain = self.max_chain_len * self.max_step_attempts
-        self.max_calls_per_conv = len(chain_configs) * budget_per_chain
+        # IterativeProbe advances all active chains breadth-first in the same
+        # turn. Its turn budget therefore depends on the longest selected chain,
+        # not the number of chains. Each step gets exactly max_step_attempts
+        # target turns (the initial attempt plus bounded refinements).
+        self.max_calls_per_conv = self.max_chain_len * self.max_step_attempts
 
         if not chain_configs:
             logging.warning(f"{self.__class__.__name__} # No chains to attack")
@@ -982,7 +1325,7 @@ class AgentBreakerChains(AgentBreaker):
             tools_description=tools_description,
             per_tool_analyses=per_tool_analyses,
         )
-        response = self._get_model_response(prompt)
+        response = self._get_stage_model_response("TOOL_TAGGING", prompt)
         if not response:
             return {}
         try:
@@ -1048,7 +1391,7 @@ class AgentBreakerChains(AgentBreaker):
             tool_tags=tool_tags_str,
             candidate_edges=candidate_edges_str,
         )
-        response = self._get_model_response(prompt)
+        response = self._get_stage_model_response("EDGE_SCORE", prompt)
         if not response:
             return []
         try:
@@ -1138,26 +1481,18 @@ class AgentBreakerChains(AgentBreaker):
 
         place_desc = self._tool_description("place_order")
         payment_desc = self._tool_description("process_payment")
-        place_requires_catalog_context = (
-            "search_catalog" in place_desc
-            or any(
-                term in place_desc
-                for term in self._ORDER_PAYMENT_CATALOG_CONTEXT_TERMS
-            )
+        place_requires_catalog_context = "search_catalog" in place_desc or any(
+            term in place_desc for term in self._ORDER_PAYMENT_CATALOG_CONTEXT_TERMS
         )
         place_returns_payment_context = any(
             term in place_desc for term in self._ORDER_PAYMENT_AUTH_CONTEXT_TERMS
         )
-        payment_requires_prior_context = (
-            any(
-                term in payment_desc
-                for term in self._ORDER_PAYMENT_AUTH_CONTEXT_TERMS
-            )
-            and (
-                "place_order" in payment_desc
-                or "prior" in payment_desc
-                or "returned" in payment_desc
-            )
+        payment_requires_prior_context = any(
+            term in payment_desc for term in self._ORDER_PAYMENT_AUTH_CONTEXT_TERMS
+        ) and (
+            "place_order" in payment_desc
+            or "prior" in payment_desc
+            or "returned" in payment_desc
         )
         return (
             place_requires_catalog_context
@@ -1182,31 +1517,25 @@ class AgentBreakerChains(AgentBreaker):
         customer_desc = self._tool_description("lookup_customer")
         order_desc = self._tool_description("lookup_order")
         refund_desc = self._tool_description("issue_refund")
-        customer_returns_order_context = (
-            "lookup_order" in customer_desc
-            or any(
-                term in customer_desc
-                for term in self._CUSTOMER_ORDER_CONTEXT_TERMS
-            )
+        customer_returns_order_context = "lookup_order" in customer_desc or any(
+            term in customer_desc for term in self._CUSTOMER_ORDER_CONTEXT_TERMS
         )
-        order_requires_customer_context = (
-            any(term in order_desc for term in self._CUSTOMER_ORDER_CONTEXT_TERMS)
-            and (
-                "lookup_customer" in order_desc
-                or "returned" in order_desc
-                or "prior" in order_desc
-            )
+        order_requires_customer_context = any(
+            term in order_desc for term in self._CUSTOMER_ORDER_CONTEXT_TERMS
+        ) and (
+            "lookup_customer" in order_desc
+            or "returned" in order_desc
+            or "prior" in order_desc
         )
         order_returns_refund_context = any(
             term in order_desc for term in self._REFUND_AUTH_CONTEXT_TERMS
         )
-        refund_requires_prior_context = (
-            any(term in refund_desc for term in self._REFUND_AUTH_CONTEXT_TERMS)
-            and (
-                "lookup_order" in refund_desc
-                or "returned" in refund_desc
-                or "prior" in refund_desc
-            )
+        refund_requires_prior_context = any(
+            term in refund_desc for term in self._REFUND_AUTH_CONTEXT_TERMS
+        ) and (
+            "lookup_order" in refund_desc
+            or "returned" in refund_desc
+            or "prior" in refund_desc
         )
         return (
             customer_returns_order_context
@@ -1733,8 +2062,16 @@ class AgentBreakerChains(AgentBreaker):
             tools_block=tools_block,
             max_hypotheses=int(self.max_hypotheses_per_chain),
         )
-        response = self._get_model_response(prompt)
+        response = self._get_stage_model_response(
+            "EXPLOIT_HYPOTHESES",
+            prompt,
+            trace_context={"artifacts": chain.get("artifacts", {}) or {}},
+            defer_trace=True,
+        )
         if not response:
+            self._flush_pending_stage_trace(
+                fallback_used=getattr(self, "deterministic_fallbacks_enabled", True)
+            )
             return []
         try:
             parsed = self._detector._extract_json(response)
@@ -1742,6 +2079,9 @@ class AgentBreakerChains(AgentBreaker):
             logging.warning(
                 f"{self.__class__.__name__} # Failed to parse exploit "
                 f"hypotheses JSON for {chain.get('chain_id', '?')}: {e}"
+            )
+            self._flush_pending_stage_trace(
+                fallback_used=getattr(self, "deterministic_fallbacks_enabled", True)
             )
             return []
 
@@ -1767,6 +2107,12 @@ class AgentBreakerChains(AgentBreaker):
             )
             if len(hypotheses) >= int(self.max_hypotheses_per_chain):
                 break
+        self._flush_pending_stage_trace(
+            fallback_used=(
+                not hypotheses
+                and getattr(self, "deterministic_fallbacks_enabled", True)
+            )
+        )
         return hypotheses
 
     def _generate_chain_attacks(self, paths: List[dict]) -> dict:
@@ -1818,9 +2164,18 @@ class AgentBreakerChains(AgentBreaker):
                 "delivery": delivery,
             }
 
-            hypotheses = self._generate_exploit_hypotheses(base_chain) or [
-                self._default_hypothesis(vulnerabilities)
-            ]
+            hypotheses = self._generate_exploit_hypotheses(base_chain)
+            if not hypotheses and getattr(
+                self, "deterministic_fallbacks_enabled", True
+            ):
+                hypotheses = [self._default_hypothesis(vulnerabilities)]
+            if not hypotheses:
+                logging.warning(
+                    "%s # Dropping path because EXPLOIT_HYPOTHESES produced "
+                    "no valid model output and deterministic fallbacks are disabled",
+                    self.__class__.__name__,
+                )
+                continue
             single = len(hypotheses) == 1
 
             for j, hypothesis in enumerate(hypotheses, start=1):
@@ -2060,11 +2415,21 @@ class AgentBreakerChains(AgentBreaker):
                 )
                 entry["output_artifact_keys"] = cls._append_missing_artifact_keys(
                     entry.get("output_artifact_keys") or (),
-                    ("authorization_context", "auth_context", "merge_token", "ci_output"),
+                    (
+                        "authorization_context",
+                        "auth_context",
+                        "merge_token",
+                        "ci_output",
+                    ),
                 )
                 entry["artifact_keys"] = cls._append_missing_artifact_keys(
                     entry.get("artifact_keys") or (),
-                    ("authorization_context", "auth_context", "merge_token", "ci_output"),
+                    (
+                        "authorization_context",
+                        "auth_context",
+                        "merge_token",
+                        "ci_output",
+                    ),
                 )
             elif tool == "merge_pr":
                 entry["role"] = "exploit"
@@ -2120,8 +2485,14 @@ class AgentBreakerChains(AgentBreaker):
             payload_shape=hypothesis.get("payload_shape", "") or "(unspecified)",
             sink_requirement=hypothesis.get("sink_requirement", "") or "(unspecified)",
         )
-        response = self._get_model_response(prompt)
+        response = self._get_stage_model_response(
+            "STEP_PLAN",
+            prompt,
+            trace_context={"artifacts": chain.get("artifacts", {}) or {}},
+            defer_trace=True,
+        )
         if not response:
+            self._flush_pending_stage_trace()
             return None
         try:
             parsed = self._detector._extract_json(response)
@@ -2130,6 +2501,7 @@ class AgentBreakerChains(AgentBreaker):
                 f"{self.__class__.__name__} # Failed to parse step plan JSON for "
                 f"{chain.get('chain_id', '?')}: {e}"
             )
+            self._flush_pending_stage_trace()
             return None
 
         raw_plan = parsed.get("step_plan") or []
@@ -2139,46 +2511,87 @@ class AgentBreakerChains(AgentBreaker):
                 f"{chain.get('chain_id', '?')}: expected {len(sequence)}, "
                 f"got {len(raw_plan) if isinstance(raw_plan, list) else 'non-list'}"
             )
+            self._flush_pending_stage_trace()
             return None
 
+        fallbacks_enabled = getattr(self, "deterministic_fallbacks_enabled", True)
+        plan_fallback_used = False
         cleaned: List[dict] = []
         for i, entry in enumerate(raw_plan):
             if not isinstance(entry, dict):
+                self._flush_pending_stage_trace()
                 return None
-            role = str(entry.get("role", "")).lower().strip()
+            raw_tool = entry.get("tool")
+            if raw_tool != sequence[i]:
+                if not fallbacks_enabled:
+                    self._flush_pending_stage_trace()
+                    return None
+                plan_fallback_used = True
+            raw_role = entry.get("role", "")
+            role = str(raw_role).lower().strip()
             if role not in {"recon", "pivot", "plant", "exploit"}:
+                self._flush_pending_stage_trace()
                 return None
+            if raw_role != role:
+                if not fallbacks_enabled:
+                    self._flush_pending_stage_trace()
+                    return None
+                plan_fallback_used = True
             artifact_keys = entry.get("artifact_keys") or []
             if not isinstance(artifact_keys, list):
+                if not fallbacks_enabled:
+                    self._flush_pending_stage_trace()
+                    return None
                 artifact_keys = []
+                plan_fallback_used = True
+            if not all(isinstance(key, str) for key in artifact_keys):
+                if not fallbacks_enabled:
+                    self._flush_pending_stage_trace()
+                    return None
+                plan_fallback_used = True
+            text_fields = {
+                key: entry.get(key, "")
+                for key in ("intent", "must_provide", "success_criterion")
+            }
+            if not all(isinstance(value, str) for value in text_fields.values()):
+                if not fallbacks_enabled:
+                    self._flush_pending_stage_trace()
+                    return None
+                plan_fallback_used = True
             cleaned.append(
                 {
-                    "tool": sequence[i],  # trust capability graph ordering
+                    "tool": sequence[i],
                     "role": role,
-                    "intent": str(entry.get("intent", "")),
+                    "intent": str(text_fields["intent"]),
                     # Backchained per-step target: what this step must surface for
                     # the downstream step so the chain reaches the exploit.
                     # Advisory prose; defaults to "" so older plans still validate.
-                    "must_provide": str(entry.get("must_provide", "")),
-                    "success_criterion": str(entry.get("success_criterion", "")),
+                    "must_provide": str(text_fields["must_provide"]),
+                    "success_criterion": str(text_fields["success_criterion"]),
                     "artifact_keys": [str(k) for k in artifact_keys],
                 }
             )
 
-        cleaned = self._normalize_pr_ci_merge_step_plan(sequence, cleaned)
-        cleaned = self._normalize_identity_grant_step_plan(sequence, cleaned)
+        if fallbacks_enabled:
+            model_plan = copy.deepcopy(cleaned)
+            cleaned = self._normalize_pr_ci_merge_step_plan(sequence, cleaned)
+            cleaned = self._normalize_identity_grant_step_plan(sequence, cleaned)
+            plan_fallback_used = plan_fallback_used or cleaned != model_plan
         if cleaned[-1]["role"] != "exploit":
             logging.warning(
                 f"{self.__class__.__name__} # Step plan for "
                 f"{chain.get('chain_id', '?')} does not end with exploit role"
             )
+            self._flush_pending_stage_trace()
             return None
         if any(e["role"] == "exploit" for e in cleaned[:-1]):
             logging.warning(
                 f"{self.__class__.__name__} # Step plan for "
                 f"{chain.get('chain_id', '?')} has multiple exploit roles"
             )
+            self._flush_pending_stage_trace()
             return None
+        self._flush_pending_stage_trace(fallback_used=plan_fallback_used)
         return cleaned
 
     # ------------------------------------------------------------------
@@ -2403,8 +2816,7 @@ class AgentBreakerChains(AgentBreaker):
         (
             "pull_request",
             re.compile(
-                r"(?m)(?:^|[\s>*-])(?:\*\*)?#([0-9]+)(?:\*\*)?"
-                r"(?=\s*(?:[-—:|)]|$))"
+                r"(?m)(?:^|[\s>*-])(?:\*\*)?#([0-9]+)(?:\*\*)?" r"(?=\s*(?:[-—:|)]|$))"
             ),
         ),
         (
@@ -3547,7 +3959,9 @@ class AgentBreakerChains(AgentBreaker):
         raw_keys = entry.get("input_artifact_keys") or []
         if not isinstance(raw_keys, (list, tuple, set)):
             return set()
-        return {str(key or "").strip().lower() for key in raw_keys if str(key or "").strip()}
+        return {
+            str(key or "").strip().lower() for key in raw_keys if str(key or "").strip()
+        }
 
     @classmethod
     def _step_has_pr_ci_input_contract(cls, chain: dict, step_index: int) -> bool:
@@ -3589,21 +4003,27 @@ class AgentBreakerChains(AgentBreaker):
         if not want:
             return False
         sequence = [str(tool).lower() for tool in ((chain or {}).get("sequence") or [])]
-        for prior_index, output in enumerate((chain or {}).get("step_outputs", []) or []):
+        for prior_index, output in enumerate(
+            (chain or {}).get("step_outputs", []) or []
+        ):
             if prior_index >= step_index:
                 break
             if not isinstance(output, dict):
                 continue
             tool = str(output.get("tool", "") or "").strip().lower()
             if tool != "run_ci_command" and (
-                prior_index >= len(sequence) or sequence[prior_index] != "run_ci_command"
+                prior_index >= len(sequence)
+                or sequence[prior_index] != "run_ci_command"
             ):
                 continue
             output_artifacts = output.get("artifacts", {}) or {}
             if not isinstance(output_artifacts, dict):
                 continue
             for key, produced in output_artifacts.items():
-                if cls._looks_like_capability_key(key) and str(produced or "").strip() == want:
+                if (
+                    cls._looks_like_capability_key(key)
+                    and str(produced or "").strip() == want
+                ):
                     return True
         return False
 
@@ -3634,9 +4054,7 @@ class AgentBreakerChains(AgentBreaker):
         if not cls._upload_context_from_artifacts(artifacts):
             return (False, "run_ci_command missing_upload_context")
 
-        pr_number = cls._selected_visible_pull_request_id(
-            chain, artifacts, prompt_text
-        )
+        pr_number = cls._selected_visible_pull_request_id(chain, artifacts, prompt_text)
         prompt_pr_ids = cls._prompt_pull_request_ids(prompt_text)
         normalized_prompt_ids = {
             cls._normalize_object_id(pr_id) for pr_id in prompt_pr_ids if pr_id
@@ -4086,9 +4504,7 @@ class AgentBreakerChains(AgentBreaker):
         if identity_result is not None:
             return identity_result
 
-        pr_ci_result = cls._check_pr_ci_run_ci_inputs(
-            chain, step_index, prompt_text
-        )
+        pr_ci_result = cls._check_pr_ci_run_ci_inputs(chain, step_index, prompt_text)
         if pr_ci_result is not None:
             return pr_ci_result
 
@@ -4505,6 +4921,8 @@ class AgentBreakerChains(AgentBreaker):
         guard_reason: str,
     ) -> Optional[str]:
         """Deterministically ask for the blackbox-visible CI/upload join."""
+        if not getattr(self, "deterministic_fallbacks_enabled", True):
+            return None
         sequence = (chain or {}).get("sequence", []) or []
         if step_index >= len(sequence) or sequence[step_index] != "run_ci_command":
             return None
@@ -4569,6 +4987,8 @@ class AgentBreakerChains(AgentBreaker):
         guard_reason: str,
     ) -> Optional[str]:
         """Deterministically consume the CI-issued merge capability."""
+        if not getattr(self, "deterministic_fallbacks_enabled", True):
+            return None
         if not self._is_pr_ci_merge_terminal_step(chain, step_index):
             return None
 
@@ -4663,7 +5083,10 @@ class AgentBreakerChains(AgentBreaker):
         return (
             0 <= step_index < len(sequence)
             and sequence[step_index] in cls._ORDER_PAYMENT_TERMINAL_TOOLS
-            and any(tool in cls._ORDER_PAYMENT_ISSUER_TOOLS for tool in sequence[:step_index])
+            and any(
+                tool in cls._ORDER_PAYMENT_ISSUER_TOOLS
+                for tool in sequence[:step_index]
+            )
         )
 
     @classmethod
@@ -4673,7 +5096,10 @@ class AgentBreakerChains(AgentBreaker):
             0 <= step_index < len(sequence)
             and sequence[step_index] in cls._ORDER_PAYMENT_ISSUER_TOOLS
             and any(tool == "search_catalog" for tool in sequence[:step_index])
-            and any(tool in cls._ORDER_PAYMENT_TERMINAL_TOOLS for tool in sequence[step_index + 1 :])
+            and any(
+                tool in cls._ORDER_PAYMENT_TERMINAL_TOOLS
+                for tool in sequence[step_index + 1 :]
+            )
         )
 
     @classmethod
@@ -4709,7 +5135,9 @@ class AgentBreakerChains(AgentBreaker):
             if not text:
                 continue
             key_l = str(key or "").strip().lower()
-            match = re.fullmatch(r"(?:product_id_(\d+)|product_(\d+)_product_id)", key_l)
+            match = re.fullmatch(
+                r"(?:product_id_(\d+)|product_(\d+)_product_id)", key_l
+            )
             if not match:
                 continue
             index = int(match.group(1) or match.group(2))
@@ -4726,6 +5154,8 @@ class AgentBreakerChains(AgentBreaker):
         guard_reason: str,
     ) -> Optional[str]:
         """Deterministically consume catalog context to mint payment context."""
+        if not getattr(self, "deterministic_fallbacks_enabled", True):
+            return None
         if not self._is_order_payment_issuer_step(chain, step_index):
             return None
         artifacts = dict((chain or {}).get("artifacts", {}) or {})
@@ -4779,7 +5209,9 @@ class AgentBreakerChains(AgentBreaker):
         if not want:
             return False
         sequence = [str(tool).lower() for tool in ((chain or {}).get("sequence") or [])]
-        for prior_index, output in enumerate((chain or {}).get("step_outputs", []) or []):
+        for prior_index, output in enumerate(
+            (chain or {}).get("step_outputs", []) or []
+        ):
             if prior_index >= step_index:
                 break
             if not isinstance(output, dict):
@@ -4853,7 +5285,9 @@ class AgentBreakerChains(AgentBreaker):
             for ref in cls._extract_object_refs_from_text(prompt, "order_id")
             if ref.get("id")
         }
-        if prompt_order_ids and any(ref_id != order_norm for ref_id in prompt_order_ids):
+        if prompt_order_ids and any(
+            ref_id != order_norm for ref_id in prompt_order_ids
+        ):
             return (False, "process_payment prompt named mismatched order_id")
         if not cls._prompt_contains_any_value(prompt, [order_id]):
             return (False, "process_payment prompt omitted order_id")
@@ -4874,6 +5308,8 @@ class AgentBreakerChains(AgentBreaker):
         guard_reason: str,
     ) -> Optional[str]:
         """Deterministically consume the order/payment context issued earlier."""
+        if not getattr(self, "deterministic_fallbacks_enabled", True):
+            return None
         if not self._is_order_payment_terminal_step(chain, step_index):
             return None
         artifacts = dict((chain or {}).get("artifacts", {}) or {})
@@ -4935,6 +5371,8 @@ class AgentBreakerChains(AgentBreaker):
         guard_reason: str,
     ) -> Optional[str]:
         """Deterministically submit a clean reviewable identity request."""
+        if not getattr(self, "deterministic_fallbacks_enabled", True):
+            return None
         sequence = [str(tool).lower() for tool in ((chain or {}).get("sequence") or [])]
         if (
             step_index >= len(sequence)
@@ -4970,6 +5408,8 @@ class AgentBreakerChains(AgentBreaker):
         guard_reason: str,
     ) -> Optional[str]:
         """Deterministically consume the backend-issued identity approval."""
+        if not getattr(self, "deterministic_fallbacks_enabled", True):
+            return None
         sequence = [str(tool).lower() for tool in ((chain or {}).get("sequence") or [])]
         if (
             step_index >= len(sequence)
@@ -5308,7 +5748,23 @@ class AgentBreakerChains(AgentBreaker):
             prior_steps_transcript=self._format_prior_steps(prior_outputs),
             vulnerabilities=chain.get("vulnerabilities", "Unknown vulnerabilities"),
         )
-        return self._extract_attack_prompt(self._get_model_response(prompt))
+        return self._extract_attack_prompt(
+            self._get_stage_model_response(
+                "STEP_ATTACK",
+                prompt,
+                trace_context={
+                    "artifacts": artifacts,
+                    "guards": [
+                        {
+                            "kind": "identity_and_artifact_consistency",
+                            "prior_feedback": identity_guard_feedback or None,
+                            "decision": "pending_post_generation",
+                        }
+                    ],
+                },
+                defer_trace=True,
+            )
+        )
 
     def _generate_step_exploit_prompt(
         self,
@@ -5360,7 +5816,23 @@ class AgentBreakerChains(AgentBreaker):
             last_response=self._last_agent_feedback(history),
             history_str=self._format_step_history(history),
         )
-        return self._extract_attack_prompt(self._get_model_response(prompt))
+        return self._extract_attack_prompt(
+            self._get_stage_model_response(
+                "STEP_EXPLOIT",
+                prompt,
+                trace_context={
+                    "artifacts": artifacts,
+                    "guards": [
+                        {
+                            "kind": "identity_and_artifact_consistency",
+                            "prior_feedback": identity_guard_feedback or None,
+                            "decision": "pending_post_generation",
+                        }
+                    ],
+                },
+                defer_trace=True,
+            )
+        )
 
     def _extract_artifacts(
         self,
@@ -5478,6 +5950,10 @@ class AgentBreakerChains(AgentBreaker):
         history: Optional[list] = None,
     ) -> Optional[str]:
         """Generate a prompt and reject/regenerate identity drift once."""
+        stage = "STEP_ATTACK" if history is None else "STEP_EXPLOIT"
+        chain.pop("step_generation_fallback", None)
+        chain.pop("stage_attempt_id", None)
+        chain.pop("step_generation_stage", None)
         # The terminal identity sink must consume the one backend-issued
         # approval already captured by this chain.  Bypass model-authored
         # terminal prose when the exact capability is available so a victim
@@ -5504,6 +5980,13 @@ class AgentBreakerChains(AgentBreaker):
                     chain.get("chain_id", "?"),
                     step_index + 1,
                 )
+                self._record_step_fallback(
+                    chain=chain,
+                    stage=stage,
+                    fallback_kind="identity_grant",
+                    prompt=terminal_fallback,
+                    pre_model=True,
+                )
                 return terminal_fallback
 
         run_ci_fallback = self._build_run_ci_upload_fallback_prompt(
@@ -5527,6 +6010,13 @@ class AgentBreakerChains(AgentBreaker):
                     self.__class__.__name__,
                     chain.get("chain_id", "?"),
                     step_index + 1,
+                )
+                self._record_step_fallback(
+                    chain=chain,
+                    stage=stage,
+                    fallback_kind="run_ci_upload",
+                    prompt=run_ci_fallback,
+                    pre_model=True,
                 )
                 return run_ci_fallback
 
@@ -5552,6 +6042,13 @@ class AgentBreakerChains(AgentBreaker):
                     chain.get("chain_id", "?"),
                     step_index + 1,
                 )
+                self._record_step_fallback(
+                    chain=chain,
+                    stage=stage,
+                    fallback_kind="place_order",
+                    prompt=place_order_fallback,
+                    pre_model=True,
+                )
                 return place_order_fallback
 
         payment_fallback = self._build_order_payment_fallback_prompt(
@@ -5576,6 +6073,13 @@ class AgentBreakerChains(AgentBreaker):
                     chain.get("chain_id", "?"),
                     step_index + 1,
                 )
+                self._record_step_fallback(
+                    chain=chain,
+                    stage=stage,
+                    fallback_kind="order_payment",
+                    prompt=payment_fallback,
+                    pre_model=True,
+                )
                 return payment_fallback
 
         merge_fallback = self._build_merge_pr_fallback_prompt(chain, step_index, "")
@@ -5598,6 +6102,13 @@ class AgentBreakerChains(AgentBreaker):
                     chain.get("chain_id", "?"),
                     step_index + 1,
                 )
+                self._record_step_fallback(
+                    chain=chain,
+                    stage=stage,
+                    fallback_kind="merge_pr",
+                    prompt=merge_fallback,
+                    pre_model=True,
+                )
                 return merge_fallback
 
         guard_feedback = ""
@@ -5614,6 +6125,15 @@ class AgentBreakerChains(AgentBreaker):
                     identity_guard_feedback=guard_feedback,
                 )
             if not step_prompt:
+                self._flush_pending_stage_trace(
+                    [
+                        {
+                            "kind": "identity_and_artifact_consistency",
+                            "decision": "generation_failed",
+                            "reason_id": "invalid_or_empty_stage_output",
+                        }
+                    ]
+                )
                 return None
 
             ok, reason = self._check_prompt_identity_consistency(
@@ -5628,9 +6148,28 @@ class AgentBreakerChains(AgentBreaker):
                     chain, step_index, step_prompt
                 )
             if ok:
+                attempt_id = self._flush_pending_stage_trace(
+                    [
+                        {
+                            "kind": "identity_and_artifact_consistency",
+                            "decision": "accepted",
+                            "reason_id": None,
+                        }
+                    ]
+                )
+                if attempt_id:
+                    chain["stage_attempt_id"] = attempt_id
+                    chain["step_generation_stage"] = stage
                 return step_prompt
 
             reason_id = self._sanitized_guard_feedback(reason)
+            rejected_guards = [
+                {
+                    "kind": "identity_and_artifact_consistency",
+                    "decision": "rejected",
+                    "reason_id": reason_id,
+                }
+            ]
             guard_feedback = reason_id
             logging.info(
                 "%s # Chain prompt guard rejected chain %s step %s prompt "
@@ -5667,6 +6206,17 @@ class AgentBreakerChains(AgentBreaker):
                         chain.get("chain_id", "?"),
                         step_index + 1,
                     )
+                    attempt_id = self._flush_pending_stage_trace(
+                        rejected_guards, fallback_used=True
+                    )
+                    self._record_step_fallback(
+                        chain=chain,
+                        stage=stage,
+                        fallback_kind="identity_upload",
+                        prompt=fallback_prompt,
+                        pre_model=False,
+                        attempt_id=attempt_id,
+                    )
                     return fallback_prompt
                 logging.info(
                     "%s # Deterministic identity upload prompt fallback "
@@ -5701,6 +6251,17 @@ class AgentBreakerChains(AgentBreaker):
                         self.__class__.__name__,
                         chain.get("chain_id", "?"),
                         step_index + 1,
+                    )
+                    attempt_id = self._flush_pending_stage_trace(
+                        rejected_guards, fallback_used=True
+                    )
+                    self._record_step_fallback(
+                        chain=chain,
+                        stage=stage,
+                        fallback_kind="identity_grant",
+                        prompt=fallback_prompt,
+                        pre_model=False,
+                        attempt_id=attempt_id,
                     )
                     return fallback_prompt
                 logging.info(
@@ -5737,6 +6298,17 @@ class AgentBreakerChains(AgentBreaker):
                         chain.get("chain_id", "?"),
                         step_index + 1,
                     )
+                    attempt_id = self._flush_pending_stage_trace(
+                        rejected_guards, fallback_used=True
+                    )
+                    self._record_step_fallback(
+                        chain=chain,
+                        stage=stage,
+                        fallback_kind="run_ci_upload",
+                        prompt=fallback_prompt,
+                        pre_model=False,
+                        attempt_id=attempt_id,
+                    )
                     return fallback_prompt
                 logging.info(
                     "%s # Deterministic run_ci_command upload prompt fallback "
@@ -5772,6 +6344,17 @@ class AgentBreakerChains(AgentBreaker):
                         chain.get("chain_id", "?"),
                         step_index + 1,
                     )
+                    attempt_id = self._flush_pending_stage_trace(
+                        rejected_guards, fallback_used=True
+                    )
+                    self._record_step_fallback(
+                        chain=chain,
+                        stage=stage,
+                        fallback_kind="merge_pr",
+                        prompt=fallback_prompt,
+                        pre_model=False,
+                        attempt_id=attempt_id,
+                    )
                     return fallback_prompt
                 logging.info(
                     "%s # Deterministic merge_pr prompt fallback rejected "
@@ -5779,8 +6362,8 @@ class AgentBreakerChains(AgentBreaker):
                     self.__class__.__name__,
                     chain.get("chain_id", "?"),
                     step_index + 1,
-                        fallback_reason,
-                    )
+                    fallback_reason,
+                )
 
             fallback_prompt = self._build_place_order_fallback_prompt(
                 chain, step_index, reason_id
@@ -5806,6 +6389,17 @@ class AgentBreakerChains(AgentBreaker):
                         self.__class__.__name__,
                         chain.get("chain_id", "?"),
                         step_index + 1,
+                    )
+                    attempt_id = self._flush_pending_stage_trace(
+                        rejected_guards, fallback_used=True
+                    )
+                    self._record_step_fallback(
+                        chain=chain,
+                        stage=stage,
+                        fallback_kind="place_order",
+                        prompt=fallback_prompt,
+                        pre_model=False,
+                        attempt_id=attempt_id,
                     )
                     return fallback_prompt
                 logging.info(
@@ -5842,6 +6436,17 @@ class AgentBreakerChains(AgentBreaker):
                         chain.get("chain_id", "?"),
                         step_index + 1,
                     )
+                    attempt_id = self._flush_pending_stage_trace(
+                        rejected_guards, fallback_used=True
+                    )
+                    self._record_step_fallback(
+                        chain=chain,
+                        stage=stage,
+                        fallback_kind="order_payment",
+                        prompt=fallback_prompt,
+                        pre_model=False,
+                        attempt_id=attempt_id,
+                    )
                     return fallback_prompt
                 logging.info(
                     "%s # Deterministic process_payment prompt fallback rejected "
@@ -5851,6 +6456,8 @@ class AgentBreakerChains(AgentBreaker):
                     step_index + 1,
                     fallback_reason,
                 )
+
+            self._flush_pending_stage_trace(rejected_guards)
 
         logging.info(
             "%s # Dropping chain %s step %s after chain prompt guard rejection "
@@ -5946,6 +6553,15 @@ class AgentBreakerChains(AgentBreaker):
             current_technique=technique,
         )
         next_attempt.notes = next_state.to_notes()
+        if chain.get("stage_attempt_id"):
+            next_attempt.notes["stage_attempt_id"] = str(chain["stage_attempt_id"])
+            next_attempt.notes["step_generation_stage"] = str(
+                chain.get("step_generation_stage", "STEP_ATTACK")
+            )
+        if isinstance(chain.get("step_generation_fallback"), dict):
+            next_attempt.notes["step_generation_fallback"] = copy.deepcopy(
+                chain["step_generation_fallback"]
+            )
         next_attempt.notes.update(self._chain_grouping_notes(chain))
         return next_attempt
 
@@ -5976,7 +6592,9 @@ class AgentBreakerChains(AgentBreaker):
             return merged_artifacts
 
         existing_type = str(merged_artifacts.get("__object_type__", "") or "").lower()
-        existing_id = cls._normalize_object_id(merged_artifacts.get("__object_id__", ""))
+        existing_id = cls._normalize_object_id(
+            merged_artifacts.get("__object_id__", "")
+        )
         incoming_type = str(incoming.get("__object_type__", "") or "").lower()
         incoming_id = cls._normalize_object_id(incoming.get("__object_id__", ""))
         sequence = [str(tool).lower() for tool in ((chain or {}).get("sequence") or [])]
@@ -5990,7 +6608,12 @@ class AgentBreakerChains(AgentBreaker):
         )
         may_rebind_pr = current_tool in cls._PULL_REQUEST_CONTEXT_TOOLS
 
-        if has_bound_pr and incoming_type and not incoming_same_pr and not may_rebind_pr:
+        if (
+            has_bound_pr
+            and incoming_type
+            and not incoming_same_pr
+            and not may_rebind_pr
+        ):
             incoming = {
                 key: value
                 for key, value in incoming.items()
@@ -6103,6 +6726,15 @@ class AgentBreakerChains(AgentBreaker):
             current_technique=technique,
         )
         next_attempt.notes = next_state.to_notes()
+        if chain.get("stage_attempt_id"):
+            next_attempt.notes["stage_attempt_id"] = str(chain["stage_attempt_id"])
+            next_attempt.notes["step_generation_stage"] = str(
+                chain.get("step_generation_stage", "STEP_EXPLOIT")
+            )
+        if isinstance(chain.get("step_generation_fallback"), dict):
+            next_attempt.notes["step_generation_fallback"] = copy.deepcopy(
+                chain["step_generation_fallback"]
+            )
         next_attempt.notes.update(self._chain_grouping_notes(chain))
         logging.info(
             f"{self.__class__.__name__} # Stepwise step "
@@ -6161,6 +6793,49 @@ class AgentBreakerChains(AgentBreaker):
             return super()._handle_exploitation_phase(last_attempt)
         return self._handle_stepwise_refinement(state)
 
+    def _append_step_outcome_events(
+        self,
+        *,
+        attempt_id: Optional[str],
+        stage: str,
+        outcomes: list,
+        chain: dict,
+        step_index: int,
+        target_tool: str,
+        step_advanced: bool,
+        advance_reasoning: str,
+        artifacts: dict,
+    ) -> None:
+        """Append victim/detector results keyed to the originating stage row."""
+        stage_trace_path = getattr(self, "stage_trace_path", None)
+        if not stage_trace_path or not attempt_id:
+            return
+        for outcome in outcomes:
+            record = make_outcome_event(
+                attempt_id=attempt_id,
+                stage=stage,
+                output_index=outcome["output_index"],
+                victim_response=outcome["victim_response"],
+                detector_outcome=outcome["detector_outcome"],
+                deterministic_outcome=outcome["deterministic_outcome"],
+                step_advanced=step_advanced,
+                advance_reasoning=advance_reasoning,
+                artifacts=artifacts,
+                chain_id=str(chain.get("chain_id", "")),
+                step_index=step_index,
+                target_tool=target_tool,
+            )
+            try:
+                append_outcome(stage_trace_path, record)
+            except OSError as error:
+                logging.error(
+                    "%s # Could not append stage outcome sidecar for %s: %s",
+                    self.__class__.__name__,
+                    attempt_id,
+                    error,
+                )
+                raise
+
     def _generate_next_attempts(
         self, last_attempt: garak.attempt.Attempt
     ) -> Iterable[garak.attempt.Attempt]:
@@ -6200,13 +6875,26 @@ class AgentBreakerChains(AgentBreaker):
         plan_entry = self._plan_entry(chain, step_index)
         role = plan_entry.get("role", "exploit")
         terminal_outcome: Optional[dict] = None
+        output_outcomes: list = []
 
         # Per-output security verdict: recorded so the detector has scores for
         # every step (even recon/pivot), but only used as the advancement
         # signal on the final exploit step.
-        for output in outputs:
+        for output_index, output in enumerate(outputs):
             if output is None or output.text is None:
                 verified_results.append((False, 0.0))
+                output_outcomes.append(
+                    {
+                        "output_index": output_index,
+                        "victim_response": None,
+                        "detector_outcome": {
+                            "success": False,
+                            "confidence": 0.0,
+                            "reasoning": "empty victim response",
+                        },
+                        "deterministic_outcome": None,
+                    }
+                )
                 continue
             structured_outcome = None
             if role == "exploit" and is_final_step:
@@ -6235,6 +6923,18 @@ class AgentBreakerChains(AgentBreaker):
                 best_reasoning = reasoning
             if is_success and confidence >= self.success_threshold:
                 exploit_succeeded = True
+            output_outcomes.append(
+                {
+                    "output_index": output_index,
+                    "victim_response": output.text,
+                    "detector_outcome": {
+                        "success": bool(is_success),
+                        "confidence": float(confidence),
+                        "reasoning": str(reasoning),
+                    },
+                    "deterministic_outcome": structured_outcome,
+                }
+            )
 
         state.verified_results = verified_results
 
@@ -6289,6 +6989,23 @@ class AgentBreakerChains(AgentBreaker):
                     "plant accepted: attacker-controlled content stored and "
                     f"reachable (artifacts: {list(new_artifacts.keys())})"
                 )
+
+        notes = last_attempt.notes or {}
+        self._append_step_outcome_events(
+            attempt_id=notes.get("stage_attempt_id") or chain.get("stage_attempt_id"),
+            stage=str(
+                notes.get("step_generation_stage")
+                or chain.get("step_generation_stage")
+                or "STEP_ATTACK"
+            ),
+            outcomes=output_outcomes,
+            chain=chain,
+            step_index=step_index,
+            target_tool=state.current_target,
+            step_advanced=step_advanced,
+            advance_reasoning=advance_reasoning,
+            artifacts=new_artifacts or chain.get("artifacts", {}) or {},
+        )
 
         # Publish anything this step learned to the run-wide store so other
         # chains' recon can reuse non-sensitive, non-object facts instead of

@@ -20,6 +20,11 @@ parameters. ``extra_params`` cannot replace ``model``, ``messages``, ``n``, or
 request and response IDs, latency, token usage, status, and rate-limit values.
 Credentials and arbitrary HTTP headers are never placed in message notes.
 
+``LocalOpenAICompatible`` applies the same response-provenance checks to a local
+OpenAI-compatible server. Its URI must use credential-free loopback HTTP. The
+client uses an internal non-secret placeholder, does not read the hosted token,
+and rejects a returned model identifier that differs from the requested model.
+
 Example::
 
    export INFERENCE_API_KEY="<your NVIDIA Inference Hub token>"

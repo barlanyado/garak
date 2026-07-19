@@ -11,7 +11,7 @@ import respx
 
 from garak.attempt import Conversation, Message, Turn
 from garak.exception import GarakException
-from garak.generators.nvidia_inference import NVIDIAInferenceHub
+from garak.generators.nvidia_inference import LocalOpenAICompatible, NVIDIAInferenceHub
 
 ENDPOINT = "https://inference.invalid/v1/"
 MODEL = "nvidia/nvidia/Nemotron-3-Nano-30B-A3B"
@@ -244,3 +244,56 @@ def test_substituted_model_identifier_is_rejected(monkeypatch):
     assert generator.last_call_metadata["error_type"] == "model_substitution"
     assert generator.last_call_metadata["returned_model"] == "substituted/model"
     assert "test-inference-token" not in json.dumps(generator.last_call_metadata)
+
+
+def test_local_provider_records_exact_response_provenance(monkeypatch):
+    monkeypatch.delenv("INFERENCE_API_KEY", raising=False)
+    endpoint = "http://127.0.0.1:8005/v1/"
+    local_model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    config = {
+        "generators": {
+            "nvidia_inference": {
+                "LocalOpenAICompatible": {
+                    "uri": endpoint,
+                    "max_retries": 0,
+                    "provider_role": "local_base",
+                }
+            }
+        }
+    }
+    generator = LocalOpenAICompatible(name=local_model, config_root=config)
+    completion = _completion()
+    completion["model"] = local_model
+    with respx.mock(base_url=endpoint) as router:
+        router.post("chat/completions").mock(
+            return_value=httpx.Response(
+                200, json=completion, headers={"x-request-id": "local-request"}
+            )
+        )
+        result = generator.generate(_prompt())
+
+    metadata = result[0].notes["response_metadata"]["nvidia_inference"]
+    assert metadata["provider"] == "local_openai_compatible"
+    assert metadata["provider_role"] == "local_base"
+    assert metadata["returned_model"] == local_model
+    assert metadata["response_id"] == "chatcmpl-test"
+    assert metadata["usage"]["total_tokens"] == 8
+    assert metadata["endpoint"] == endpoint
+    assert "local-not-secret" not in json.dumps(result[0].notes)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "http://0.0.0.0:8005/v1/",
+        "http://10.220.128.15:8005/v1/",
+        "https://127.0.0.1:8005/v1/",
+        "http://user:password@127.0.0.1:8005/v1/",
+    ],
+)
+def test_local_provider_requires_credential_free_loopback(uri):
+    config = {
+        "generators": {"nvidia_inference": {"LocalOpenAICompatible": {"uri": uri}}}
+    }
+    with pytest.raises(ValueError, match="credential-free loopback HTTP"):
+        LocalOpenAICompatible(name="local-model", config_root=config)

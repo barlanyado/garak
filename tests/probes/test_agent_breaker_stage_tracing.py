@@ -143,10 +143,11 @@ def test_hosted_baseline_config_pins_models_routes_and_target_contract():
         "nvidia/zai-org/glm-5.2"
     )
     assert probe["stage_model_roles"]["local_base"] == {
-        "model_type": "openai.OpenAICompatible",
+        "model_type": "nvidia_inference.LocalOpenAICompatible",
         "model_name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
         "model_config": {
             "uri": "http://127.0.0.1:8005/v1/",
+            "max_retries": 0,
             "suppressed_params": ["stop"],
         },
     }

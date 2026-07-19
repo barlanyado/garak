@@ -393,4 +393,59 @@ class NVIDIAInferenceHub(OpenAICompatible):
         return [Message(text=str(content), notes=notes)]
 
 
+class LocalOpenAICompatible(NVIDIAInferenceHub):
+    """Call an exact model on a loopback-only OpenAI-compatible endpoint.
+
+    This provider preserves the same response ID, returned-model, usage, latency,
+    and reasoning trace metadata as :class:`NVIDIAInferenceHub`. It supplies a
+    fixed non-secret placeholder because the OpenAI client requires a value; no
+    hosted credential or environment token is used for the local bridge.
+    """
+
+    ENV_VAR = None
+    DEFAULT_PARAMS = NVIDIAInferenceHub.DEFAULT_PARAMS | {
+        "uri": "http://127.0.0.1:8005/v1/",
+        "provider_role": "local_base",
+        "max_retries": 0,
+    }
+    generator_family_name = "Traced local OpenAI-compatible"
+
+    @staticmethod
+    def _validate_uri(uri: object) -> None:
+        try:
+            parsed = urlsplit(str(uri))
+        except ValueError:
+            raise ValueError("local OpenAI-compatible uri is invalid") from None
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "local OpenAI-compatible uri must be credential-free loopback HTTP "
+                "without query or fragment components"
+            )
+
+    def _load_unsafe(self):
+        self.api_key = "local-not-secret"
+        self.client = openai.OpenAI(
+            base_url=self.uri,
+            api_key=self.api_key,
+            max_retries=int(self.max_retries),
+        )
+        if self.name in ("", None):
+            raise ValueError(
+                "local OpenAI-compatible provider requires an exact model identifier"
+            )
+        self.generator = self.client.chat.completions
+
+    def _request_metadata(self, **kwargs) -> dict:
+        metadata = super()._request_metadata(**kwargs)
+        metadata["provider"] = "local_openai_compatible"
+        return metadata
+
+
 DEFAULT_CLASS = "NVIDIAInferenceHub"

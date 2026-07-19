@@ -312,17 +312,25 @@ def resolve_git_commit(start: Path) -> str:
         if not head.startswith("ref:"):
             return head
         ref_name = head.split(":", 1)[1].strip()
-        direct = _read_text(git_dir / ref_name)
-        if direct:
-            return direct
-        packed = _read_text(git_dir / "packed-refs")
-        if packed:
-            for line in packed.splitlines():
-                if line.startswith(("#", "^")):
-                    continue
-                parts = line.split(" ", 1)
-                if len(parts) == 2 and parts[1] == ref_name:
-                    return parts[0]
+        ref_roots = [git_dir]
+        commondir = _read_text(git_dir / "commondir")
+        if commondir:
+            common_root = Path(commondir)
+            if not common_root.is_absolute():
+                common_root = (git_dir / common_root).resolve()
+            ref_roots.append(common_root)
+        for ref_root in ref_roots:
+            direct = _read_text(ref_root / ref_name)
+            if direct:
+                return direct
+            packed = _read_text(ref_root / "packed-refs")
+            if packed:
+                for line in packed.splitlines():
+                    if line.startswith(("#", "^")):
+                        continue
+                    parts = line.split(" ", 1)
+                    if len(parts) == 2 and parts[1] == ref_name:
+                        return parts[0]
     return "unknown"
 
 

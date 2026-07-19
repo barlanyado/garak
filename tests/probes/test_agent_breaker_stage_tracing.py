@@ -16,6 +16,7 @@ from garak.probes.agent_breaker_chains import AgentBreakerChains
 from garak.resources.agent_breaker_stage import (
     STAGES,
     outcome_sidecar_path,
+    resolve_git_commit,
     sha256_text,
     validate_stage_output,
 )
@@ -100,6 +101,29 @@ def test_exact_stage_registry():
     assert validate_stage_output("STEP_PLAN", {"step_plan": []}) == [
         "$.step_plan must contain at least one step"
     ]
+
+
+def test_resolve_git_commit_from_linked_worktree_common_directory(tmp_path):
+    worktree = tmp_path / "checkout"
+    source = worktree / "garak" / "resources" / "module.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("# fixture\n", encoding="utf-8")
+
+    common = tmp_path / "repository.git"
+    git_dir = common / "worktrees" / "checkout"
+    git_dir.mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+    (git_dir / "HEAD").write_text(
+        "ref: refs/heads/NAIS-0-multitool-probe-tracing\n",
+        encoding="utf-8",
+    )
+    (git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+    branch_ref = common / "refs" / "heads" / "NAIS-0-multitool-probe-tracing"
+    branch_ref.parent.mkdir(parents=True)
+    commit = "5" * 40
+    branch_ref.write_text(commit + "\n", encoding="utf-8")
+
+    assert resolve_git_commit(source) == commit
 
 
 def test_stage_contract_rejects_non_string_list_elements():

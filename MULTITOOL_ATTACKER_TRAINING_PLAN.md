@@ -278,20 +278,141 @@ agents once, publish manifests/cards/reports, and never train on locked results.
 - Hosted and local baseline reports are reproducible from their manifests.
 - Catalog checks prove codereview/test agents cannot enter the training split.
 
+## Catalog design references
+
+The Step 10 catalog uses original, safe tool implementations and synthetic
+state. Its structure was checked against these primary benchmark sources:
+
+- [AgentDojo](https://papers.neurips.cc/paper_files/paper/2024/file/97091a5177d8dc64b1da8bf3e1f6fb54-Paper-Datasets_and_Benchmarks_Track.pdf):
+  stateful workspace, messaging, travel and finance environments; explicit
+  tool sequences; and deterministic checks against environment mutations.
+- [ToolSandbox](https://machinelearning.apple.com/research/toolsandbox-stateful-conversational-llm-benchmark):
+  composable state-dependent tools, distractors, tool-name perturbations and
+  ordered milestone evaluation.
+- [tau-bench](https://proceedings.iclr.cc/paper_files/paper/2025/hash/1b126cc38b8638e07bef37e7b2bb72bf-Abstract-Conference.html):
+  realistic domain APIs, mutable database state and repeated reliability
+  measurement rather than single examples.
+- [Berkeley Function Calling Leaderboard](https://gorilla.cs.berkeley.edu/leaderboard):
+  multi-turn and multi-step function calling, function relevance, format
+  sensitivity and hallucination measurement.
+
+These references support the chosen stateful, typed, multi-step structure. No
+benchmark records, proprietary agents or benchmark test cases were copied into
+the training or evaluation splits.
+
+## Step 1-10 execution evidence
+
+Authoritative DGX artifact root:
+
+```text
+/raid/eliyac/experiments/multitool/20260719-step10-v1
+```
+
+Frozen source commits:
+
+```text
+garak          fca4905b800309008e97184bc139c09bf2d130c2
+agent-breaker  f16769b255e9f77a7c8c15f511c5e9fe48a21085
+agents-lab     ad5c8ac6fa0aebb96495c764536cd3f61c4322b9
+```
+
+Completed evidence:
+
+- `doctor.json`: eight H100 GPUs, Docker 28.0.4, 19.8 TB free on `/raid`,
+  credential presence without its value, tmux available and Slurm absent.
+- `preflight.json`: exact hosted Nano, GPT-5.2 and GLM-5.2 routes returned the
+  requested identifiers. Nano accepted the 4,096-token direct policy and the
+  16,384-token reasoning policy. Its seeded preflight was byte-repeatable, so
+  the frozen campaign correctly used 20 measured episodes. GLM-5.2 was called
+  only for this benign route/capability preflight.
+- `arm-order-v1.json`: the initial hosted-first order is frozen; all future
+  adapter comparisons remain unauthorised and Step 11 remains disabled.
+- `hosted-nano-v1-r2/`: authoritative strict hosted baseline. All 21 episode
+  processes returned zero; all trace, outcome, provenance, range, canary and
+  container gates passed; no hosted drift was detected.
+- `hosted-nano-fallback-v1/`: separate fallback-assisted diagnostic. All 21
+  episode processes and integrity gates passed; it is explicitly not
+  model-only and is ineligible for training.
+- `hosted-nano-v1/`: retained failed smoke from the first operational attempt.
+  It is diagnostic evidence only and is never mixed into the authoritative
+  baseline. The linked-worktree commit resolver and async proxy path were fixed
+  before the clean `r2` manifest was frozen.
+
+Strict hosted Nano baseline results (`1` excluded smoke, `20` measured):
+
+```text
+report valid / model-only integrity: yes / yes
+exact-once/model-only success:       0/20 (0.0%; Wilson 95% upper 16.11%)
+intended-chain discovery:            0/20 (0.0%)
+correct plan:                        14/20 (70.0%)
+grounded tool calls:                 32/37 (86.49%)
+ANALYSIS schema validity:            16/20 (80.0%)
+all later reached-stage schemas:     100%
+attacker-stage traces/outcomes:      155 / 42
+deterministic fallback events:       0
+attacker tokens:                     631,296
+mean/max stage latency:              9,563.61 / 61,755.09 ms
+```
+
+Fallback diagnostic results (`1` excluded smoke, `20` measured):
+
+```text
+report valid / model-only:           yes / no (intentional)
+exact-once success:                  0/20 (0.0%)
+correct plan:                        13/20 (65.0%)
+grounded tool calls:                 73/91 (80.22%)
+attacker-stage traces/outcomes:      125 / 82
+fallback sidecar events:             27
+fallback-used stage attributions:    STEP_PLAN 16, STEP_ATTACK 9, STEP_EXPLOIT 18
+mean/max stage latency:              10,301.12 / 112,025.22 ms
+```
+
+The fallback diagnostic did not turn a single episode into an exact-once
+success. This strengthens the case for training the reasoning and refinement
+stages rather than relying on deterministic recovery templates.
+
+Step 10 validation on the DGX:
+
+```text
+canonical tools:     52
+training profiles:   12
+development profiles: 3
+locked-test agents:  15
+catalog SHA lock:    valid
+focused tests:       16 passed
+```
+
+The 12 training and three development profiles have five to nine exposed tools,
+two- to four-step immediate-predecessor chains, distractors, typed outputs and
+cross-split structural-fingerprint rejection. `codereview-chain-v1` is a known
+non-training baseline; the other 14 existing agents plus the sealed
+`supplier_activation` replacement form the locked set.
+
+Step 8 remains blocked on explicit GPU-service authorisation. Two pre-existing
+auto-remove TP8 vLLM containers occupy the DGX: `gracious_booth` on port 8001
+uses about 51.2 GB per GPU, and `magical_chaplygin` on port 8010 uses about
+22.1 GB per GPU. Only about 7.8 GB per H100 is free, which is insufficient for
+the pinned BF16 base. The lower-impact plan is to preserve
+`magical_chaplygin`, stop only `gracious_booth`, then serve
+`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` revision
+`cbd3fa9f933d55ef16a84236559f4ee2a0526848` at loopback port 8005 with a
+bounded GPU-memory allocation. Because `gracious_booth` was started with
+`--rm`, it must not be stopped without the user's explicit approval.
+
 ## Implementation status
 
 | Step | Status | Evidence |
 | --- | --- | --- |
-| 1 | In progress | Local branches created; plan saved here |
-| 2 | Pending | |
-| 3 | Pending | |
-| 4 | Pending | |
-| 5 | Pending | |
-| 6 | Pending | |
-| 7 | Pending | |
-| 8 | Pending | |
-| 9 | Pending | |
-| 10 | Pending | |
+| 1 | Complete | Three clean branches pushed and deployed as isolated DGX worktrees; commits, nine inputs and running container/image IDs frozen |
+| 2 | Complete | `doctor.json` and exact-route `preflight.json`; Nano seed repeatable; token value absent from artifacts |
+| 3 | Complete | Live safe codereview chain, deterministic reset/validation, exact-once capability and replay rejection verified |
+| 4 | Complete | Exact Inference Hub provider and loopback-only local provider implemented and tested |
+| 5 | Complete | Seven exact stage traces, hashes, outcome sidecar and fail-closed joins implemented; hosted artifacts validate |
+| 6 | Complete | Frozen reasoning/direct-output policy matches all three manifests |
+| 7 | Complete | Strict hosted baseline and separately labelled fallback diagnostic completed; reports and integrity gates valid |
+| 8 | Blocked on user authorisation | Local BF16 bridge cannot fit beside two pre-existing TP8 services; permission requested to stop only `gracious_booth` |
+| 9 | Hosted controls complete; local evidence pending | Seeded arm order plus pre/post canaries passed for strict and fallback hosted campaigns with no drift |
+| 10 | Complete | 52 tools, 12 train, 3 dev, 15 locked, valid SHA lock and 16 focused DGX tests |
 | 11-16 | Blocked pending user approval | Intentional review gate |
 
 ## Change notification log
@@ -301,3 +422,8 @@ agents once, publish manifests/cards/reports, and never train on locked results.
 | 2026-07-19 | All three | Created project branches | No |
 | 2026-07-19 | `garak` | Replaced the earlier draft with this approved plan and status ledger | No; project-created file |
 | 2026-07-19 | DGX deployment | Selected isolated worktrees after finding unrelated changes in all three long-lived server checkouts | No; existing checkouts remain untouched |
+| 2026-07-19 | `garak` | Added exact attacker-stage routing/tracing, NVIDIA/local providers and documentation index entries | Yes; existing probe and documentation indexes were changed |
+| 2026-07-19 | `agent-breaker` | Added the Steps 1-10 control plane, manifests, campaign/report gates and local-base recipe | Yes; existing README, justfile and pre-commit configuration were changed |
+| 2026-07-19 | `agents-lab` | Added the safe codereview chain, reusable catalog/backend, split lock, deployment and tests | Yes; existing project configuration, lock file, ignore/pre-commit files and shared `agents_lab/llm.py` were changed; legacy agent implementations were not changed |
+| 2026-07-19 | DGX deployment | Recreated the safe codereview stack and fixed Docker 28 loopback ingress plus async proxy use | No long-lived checkout was changed; only isolated worktrees/images/containers were used |
+| 2026-07-19 | Hosted experiments | Completed strict and fallback campaigns, generated reports and retained the rejected first smoke separately | No source changed during the frozen campaigns |

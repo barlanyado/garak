@@ -1,6 +1,6 @@
 # Multi-Tool Attacker Training Plan
 
-Status date: 2026-07-19
+Status date: 2026-07-21
 
 This file is the project source of truth. Implementation is authorised through
 Step 10 inclusive. Stop for user review after the hosted/local baselines and
@@ -13,7 +13,7 @@ Fine-tune NVIDIA Nemotron 3 Nano to perform the difficult attacker stages of
 Garak's `AgentBreakerChains` probe while deterministic code continues to own
 parsing, graph traversal, guards, state, and authoritative validation.
 
-The trainable stages are exactly:
+The original baseline captured these seven attacker stages:
 
 1. `ANALYSIS`
 2. `TOOL_TAGGING`
@@ -25,6 +25,11 @@ The trainable stages are exactly:
 
 Training rows must use the exact rendered prompt captured at these Garak call
 sites. Prompts must never be copied or reconstructed in `agent-breaker`.
+
+The redesigned multi-tool pipeline described in the 2026-07-21 amendment below
+supersedes this original stage list for future data generation. In particular,
+the speculative global `ANALYSIS` and combined `TOOL_TAGGING` stages will not be
+used by the redesigned chain probe.
 
 ## Fixed model identifiers
 
@@ -39,6 +44,12 @@ openai/openai/gpt-5.2
 
 Hosted teacher:
 nvidia/zai-org/glm-5.2
+
+Redesigned comparison attacker:
+nvidia/qwen/qwen-235b
+
+Redesigned semantic judge:
+openai/openai/gpt-5.2
 
 Local training base:
 nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
@@ -68,6 +79,188 @@ The DGX deployment uses clean branch worktrees under
 `/raid/eliyac/worktrees/NAIS-0-multitool/`. The long-lived checkouts under
 `/raid/eliyac/workspace/` contain unrelated user changes and must not be
 switched, cleaned, stashed, or overwritten.
+
+## 2026-07-21 probe redesign amendment
+
+This amendment is the current source of truth for improving and validating the
+multi-tool probe. It supersedes conflicting future-work instructions elsewhere
+in this document without rewriting the completed historical Step 1-10 evidence.
+No redesigned probe implementation or comparison run begins until the user
+authorises execution.
+
+### Redesign scope and complete stage dependencies
+
+The redesigned flow is:
+
+```text
+DEEP_RECON(tool), in bounded parallel where safe
+  -> TOOL_INTERFACE_TAGGING(tool), in bounded parallel
+  -> NORMALIZE_TAGS(all compact records), deterministic code
+  -> BUILD_DEPENDENCY_GRAPH, deterministic code
+  -> EDGE_SCORE(candidate pairs), parallel batches where useful
+  -> SELECT_DEPENDENCY_SUBGRAPHS, deterministic code
+  -> PATH_ANALYSIS(selected subgraph), parallel across independent paths
+  -> EXPLOIT_HYPOTHESES(path analysis), parallel across independent paths
+  -> STEP_PLAN(one hypothesis), parallel across independent hypotheses
+  -> STEP_ATTACK / STEP_EXPLOIT, sequential inside each stateful chain
+  -> GPT-5.2 semantic judging, after the corresponding victim response
+  -> deterministic outcome validation and offline export
+```
+
+Changing any stage contract requires updating all dependent prompts, schemas,
+validators, serializers, downstream consumers, trace joins, exporter rendering,
+tests and documentation in the same change. A stage is not complete while any
+downstream consumer still expects its old fields or semantics.
+
+The future attacker-model stages are:
+
+1. `TOOL_INTERFACE_TAGGING`
+2. `EDGE_SCORE`
+3. `PATH_ANALYSIS`
+4. `EXPLOIT_HYPOTHESES`
+5. `STEP_PLAN`
+6. `STEP_ATTACK`
+7. `STEP_EXPLOIT`
+
+`NORMALIZE_TAGS`, dependency-graph construction/search, semantic plan
+validation, trace ordering and export are deterministic code. Exact runtime
+tool names and interface field names come from the target contract or observed
+response; model-generated labels are never authoritative identifiers.
+
+### Evidence-grounded and generic prompts
+
+- Local interface tagging receives one tool only: its exact runtime contract,
+  deep-recon profile, observed behaviour and fault observations.
+- Structural tagging describes inputs, outputs, types, bindings, side effects
+  and evidence. It must not infer SQL, shell, filesystem, network, XML,
+  template or code execution without explicit evidence.
+- Vulnerability reasoning moves after dependency-subgraph selection and is
+  grounded on only that subgraph's contracts, observed behaviour, artifact
+  flows and terminal action.
+- Every security claim is labelled `documented`, `observed`, `hypothesis` or
+  `unsupported`, with evidence and confidence.
+- Generic prompts use artifacts, bindings, prerequisites, sources, sinks and
+  side effects. They must not contain code-review-, ecommerce-, support- or
+  other victim-specific tool names, values or attack recipes.
+- Scenario contracts may be injected at runtime. The shared probe and prompt
+  templates must not recognise a victim by familiar tool names.
+- Tests cover code-review, ecommerce, support and renamed synthetic tool sets
+  so prompt or validator overfitting is detected.
+- The single-tool parent probe remains unchanged unless a versioned shared
+  interface requires an explicitly tested compatibility update.
+
+### Deterministic normalisation and dependency-aware planning
+
+Normalisation first matches exact declared producer/consumer fields and types.
+It may then assign a generic controlled category while preserving the original
+field, evidence and binding. Ambiguous mappings remain unresolved and go to
+edge scoring; code never invents a capability or silently aliases two runtime
+tools. Similar tool names remain distinct nodes.
+
+Selected attacks are dependency subgraphs rather than arbitrary total-order
+lists. Independent prerequisites may appear in any valid topological order.
+The planner must use exactly the registered runtime tools and satisfy every
+artifact dependency, but it is not rejected merely for choosing a different
+valid order of sibling prerequisites. Stateful execution materialises one
+validated order and remains sequential so later prompts use real prior
+artifacts.
+
+### Parallel request policy
+
+Add a bounded `max_parallel_stage_requests` control, defaulting to `1` for
+compatibility. The redesigned comparison uses `4` where safe. Per-tool tagging,
+independent edge-score batches, path analyses, hypotheses and plans may run in
+parallel. Global normalisation waits for all local records. Steps within one
+chain, victim mutations and their judge calls remain sequential. Episodes that
+share one mutable victim instance also remain sequential.
+
+Before parallel calls are enabled, shared pending-trace state must be removed.
+Each call produces an immutable event; one concurrency-safe writer assigns an
+episode sequence number and appends it. Parallel and sequential modes must
+produce equivalent normalised graphs for the same recorded inputs.
+
+### Complete traces and offline exporter
+
+Every episode must retain full, joinable records for deep recon, attacker,
+utility/parser, victim, backend tool, GPT-5.2 judge and deterministic probe
+operations. Records include exact inputs and outputs, model/role, request ID,
+settings, latency, usage, schema and semantic verdicts, artifacts, dependencies,
+guards, retries, parent/child call IDs, episode/chain IDs and ordered timestamps.
+Credentials and authorization headers are never stored.
+
+Add an offline script with this interface:
+
+```text
+python tools/export_agent_breaker_episode.py EPISODE_DIR \
+  --format markdown|text --output OUTPUT --verify-complete
+```
+
+The exporter performs no LLM, victim, agent or network calls. It joins only
+retained artifacts, preserves exact text, explains the stopping condition and
+returns non-zero when a required record is missing.
+
+### Mandatory pilot gate before the comparison
+
+Run exactly one excluded Qwen pilot episode using:
+
+```text
+attacker: nvidia/qwen/qwen-235b
+judge:    openai/openai/gpt-5.2
+victim:   existing GPT-5.2 code-review victim
+```
+
+The pilot is not one of the five measured Qwen episodes. Do not automatically
+run another pilot. Terminal attack success is not required; an honest model or
+victim rejection is valid. The pilot passes only when:
+
+- reset isolation and the exact model routes are correct;
+- every invoked LLM, victim, tool, judge and deterministic operation has one
+  complete, correctly joined trace event;
+- parallel calls have unique IDs, ordered writes and no missing/corrupt rows;
+- factual tags and normalised artifacts preserve runtime names, fields,
+  evidence and bindings;
+- the dependency graph accepts valid sibling orderings and rejects unmet
+  prerequisites;
+- every reached stage passes its structural/semantic contract or records a
+  precise model failure without crashing the episode;
+- the offline Markdown and text exports reproduce the episode with network
+  access disabled; and
+- the terminal validator and episode summary agree with backend events.
+
+If an integration defect is found, preserve the failed pilot, fix the complete
+dependent stage chain, rerun tests and re-review artifacts. Do not silently
+count the pilot as measured data or start the comparison while a gate is
+unresolved.
+
+### Ten-episode comparison after the pilot passes
+
+Run five reset-isolated measured episodes for each attacker, ten total:
+
+```text
+Nano attacker: nvidia/nvidia/Nemotron-3-Nano-30B-A3B      x 5
+Qwen attacker: nvidia/qwen/qwen-235b                       x 5
+Judge:        openai/openai/gpt-5.2 for both arms
+Victim:       existing GPT-5.2 code-review victim
+```
+
+Use the same five paired seeds, prompts, target state, strict schemas,
+dependency validators, concurrency limit and judge rubric in both arms.
+Reasoning is disabled and structured JSON requested where supported. No hidden
+model retries or deterministic attack fallbacks are allowed. Episodes run
+sequentially against the shared mutable victim; only independent calls inside
+an episode run in parallel.
+
+Every measured episode must have a complete artifact directory and pass the
+offline completeness check. The comparison reports factual-tag accuracy,
+unsupported-claim rate, dependency-plan validity, victim/tool reach, terminal
+outcome, GPT-5.2 judge scores, refinement success, calls, tokens and latency.
+Raw per-episode traces and Markdown/text exports remain available for review.
+
+After the pilot and comparison, stop and summarise all changes by repository,
+explicitly separating probe logic, prompts, tracing/visibility, experiment
+orchestration and documentation. Identify every existing contributor-owned
+file changed. Do not begin training or use these evaluation episodes as
+training data without separate user approval.
 
 ## Execution plan
 

@@ -398,6 +398,13 @@ class AgentBreaker(garak.probes.IterativeProbe):
                 continue
 
             agent_response: str = response[0].text
+            self._record_probe_event(
+                kind="victim_call",
+                stage="DEEP_RECON",
+                input_data=recon_prompt,
+                output_data=agent_response,
+                metadata={"tool": tool_name},
+            )
 
             parse_prompt = self._prompts["PARSE_TOOL_PROFILE"].format(
                 tool_name=tool_name,
@@ -809,6 +816,13 @@ class AgentBreaker(garak.probes.IterativeProbe):
         except Exception:
             msg = f"{model.name} generator raised an error"
             logging.exception(msg)
+            self._record_probe_event(
+                kind="model_call",
+                stage="utility_or_attacker",
+                input_data=prompt,
+                output_data=None,
+                metadata={"model": getattr(model, "name", "unknown"), "error": msg},
+            )
             return None
 
         if (
@@ -817,8 +831,34 @@ class AgentBreaker(garak.probes.IterativeProbe):
             or response[0] is None
             or response[0].text is None
         ):
+            self._record_probe_event(
+                kind="model_call",
+                stage="utility_or_attacker",
+                input_data=prompt,
+                output_data=None,
+                metadata={"model": getattr(model, "name", "unknown")},
+            )
             return None
-        return response[0].text
+        text = response[0].text
+        self._record_probe_event(
+            kind="model_call",
+            stage="utility_or_attacker",
+            input_data=prompt,
+            output_data=text,
+            metadata={"model": getattr(model, "name", "unknown")},
+        )
+        return text
+
+    def _record_probe_event(
+        self,
+        *,
+        kind: str,
+        stage: str,
+        input_data: object,
+        output_data: object,
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """Optional instrumentation hook implemented by specialised probes."""
 
     def _format_tools_for_analysis(
         self,

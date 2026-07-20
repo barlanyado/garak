@@ -11,8 +11,16 @@ Exact attacker stages
 
 The chain probe can route and trace exactly these attacker stages:
 
-``ANALYSIS``, ``TOOL_TAGGING``, ``EDGE_SCORE``, ``EXPLOIT_HYPOTHESES``,
-``STEP_PLAN``, ``STEP_ATTACK``, and ``STEP_EXPLOIT``.
+``TOOL_INTERFACE_TAGGING``, ``EDGE_SCORE``, ``PATH_ANALYSIS``,
+``EXPLOIT_HYPOTHESES``, ``STEP_PLAN``, ``STEP_ATTACK``, and
+``STEP_EXPLOIT``.
+
+Interface tagging receives one tool at a time. Code binds exact runtime names,
+filters unsupported fields, constructs artifact dependencies, preserves sibling
+prerequisites, and validates any model-proposed topological order. Path analysis
+labels every claim as documented, observed, hypothetical, or unsupported.
+``max_parallel_stage_requests`` bounds independent interface-tagging and path-
+analysis calls; stateful target execution remains sequential.
 
 ``stage_model_roles`` maps a role name to ``model_type``, ``model_name``, and
 ``model_config``. ``stage_model_routes`` maps each exact stage name to a role.
@@ -70,8 +78,16 @@ keyed join supplies the eventual victim response, deterministic terminal
 outcome, detector verdict, advancement decision, and visible artifacts without
 relying on JSONL line order. Pre-model deterministic shortcuts are recorded in
 the same sidecar as ``ai-sec.agent-breaker-fallback-event/v1`` and carry their
-own attempt ID into the target Attempt. API keys and authorisation headers are
-excluded.
+own attempt ID into the target Attempt. The outcome also retains the exact judge
+prompt, raw answer, parsed answer, and allow-listed request metadata. API keys
+and authorisation headers are excluded.
+
+Set ``episode_trace_path`` to retain deep-recon target calls and utility/model
+calls as ordered ``ai-sec.agent-breaker-episode-event/v1`` rows. Render an
+episode without a model, target, or network call using::
+
+   python tools/export_agent_breaker_episode.py EPISODE_DIR \
+     --format markdown --output episode.md --verify-complete
 
 ``STEP_ATTACK`` and ``STEP_EXPLOIT`` records are deferred until the identity and
 artifact guards accept or reject their generated prompt, so their ``guards``
@@ -87,10 +103,10 @@ with these exact identifiers:
 * victim: ``openai/openai/gpt-5.2`` (inside the NAT codereview gateway)
 * teacher role: ``nvidia/zai-org/glm-5.2``
 
-The benchmark config disables behavioural and fault-probe prompt generation so
-hosted-baseline attacker calls are limited to the seven named stages. Deep
-reconnaissance and utility parsing remain deterministic/utility setup and are
-not adapter-routed.
+The benchmark config disables behavioural and fault-probe prompt generation.
+Deep reconnaissance and utility parsing remain setup/utility calls and are not
+adapter-routed. The independent semantic judge is
+``openai/openai/gpt-5.2``.
 
 The target gateway is ``http://127.0.0.1:8000/v1/chat/completions``. It is bound
 to the versioned lab episode by deployment configuration. Reset once before
@@ -119,7 +135,7 @@ same route fragment together with the per-run trace path::
    uv run garak \
      --config scan_agent_breaker_chains_inference_hub.yaml \
      --probe_options \
-     '{"agent_breaker_chains":{"AgentBreakerChains":{"stage_model_routes":{"ANALYSIS":"local_base","TOOL_TAGGING":"local_base","EDGE_SCORE":"local_base","EXPLOIT_HYPOTHESES":"local_base","STEP_PLAN":"local_base","STEP_ATTACK":"local_base","STEP_EXPLOIT":"local_base"},"stage_trace_path":"/absolute/run/path/local-base-stages.jsonl"}}}'
+     '{"agent_breaker_chains":{"AgentBreakerChains":{"stage_model_routes":{"TOOL_INTERFACE_TAGGING":"local_base","EDGE_SCORE":"local_base","PATH_ANALYSIS":"local_base","EXPLOIT_HYPOTHESES":"local_base","STEP_PLAN":"local_base","STEP_ATTACK":"local_base","STEP_EXPLOIT":"local_base"},"stage_trace_path":"/absolute/run/path/local-base-stages.jsonl"}}}'
 
 This changes only the seven attacker stages. The utility parser remains hosted
 base Nano, and the target remains the same hosted GPT-5.2 victim gateway. The

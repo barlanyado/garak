@@ -12,9 +12,9 @@ from urllib.parse import urlsplit, urlunsplit
 import uuid
 
 STAGES = (
-    "ANALYSIS",
-    "TOOL_TAGGING",
+    "TOOL_INTERFACE_TAGGING",
     "EDGE_SCORE",
+    "PATH_ANALYSIS",
     "EXPLOIT_HYPOTHESES",
     "STEP_PLAN",
     "STEP_ATTACK",
@@ -22,9 +22,9 @@ STAGES = (
 )
 
 STAGE_TEMPLATE_SOURCES = {
-    "ANALYSIS": "garak/data/agent_breaker/prompts.yaml",
-    "TOOL_TAGGING": "garak/data/agent_breaker_chains/prompts.yaml",
+    "TOOL_INTERFACE_TAGGING": "garak/data/agent_breaker_chains/prompts.yaml",
     "EDGE_SCORE": "garak/data/agent_breaker_chains/prompts.yaml",
+    "PATH_ANALYSIS": "garak/data/agent_breaker_chains/prompts.yaml",
     "EXPLOIT_HYPOTHESES": "garak/data/agent_breaker_chains/prompts.yaml",
     "STEP_PLAN": "garak/data/agent_breaker_chains/prompts.yaml",
     "STEP_ATTACK": "garak/data/agent_breaker_chains/prompts.yaml",
@@ -173,28 +173,20 @@ def validate_stage_output(stage: str, parsed: object) -> list[str]:
     if errors:
         return errors
 
-    if stage == "ANALYSIS":
-        analyses = _require_mapping(
-            root.get("tool_analyses"), "$.tool_analyses", errors
-        )
-        _require_string_list(root.get("priority_targets"), "$.priority_targets", errors)
-        for name, analysis in analyses.items():
-            item = _require_mapping(analysis, f"$.tool_analyses.{name}", errors)
-            for key in ("functionality", "vulnerabilities", "exploit_strategies"):
-                if not isinstance(item.get(key), str):
-                    errors.append(f"$.tool_analyses.{name}.{key} must be a string")
-            _require_string_list(
-                item.get("attack_prompts"),
-                f"$.tool_analyses.{name}.attack_prompts",
-                errors,
-            )
-    elif stage == "TOOL_TAGGING":
-        tags = _require_mapping(root.get("tool_tags"), "$.tool_tags", errors)
-        for name, tag_record in tags.items():
-            item = _require_mapping(tag_record, f"$.tool_tags.{name}", errors)
-            for key in ("consumes", "produces", "payload_types"):
-                _require_string_list(item.get(key), f"$.tool_tags.{name}.{key}", errors)
-            if item.get("capability_class") not in {
+    if stage == "TOOL_INTERFACE_TAGGING":
+        item = root
+        for key in ("consumes", "produces"):
+            fields = _require_list(item.get(key), f"$.{key}", errors)
+            for index, field in enumerate(fields):
+                record = _require_mapping(field, f"$.{key}[{index}]", errors)
+                for field_key in ("field", "type", "semantic_type", "evidence"):
+                    if not isinstance(record.get(field_key), str):
+                        errors.append(f"$.{key}[{index}].{field_key} must be a string")
+                if key == "consumes" and not isinstance(record.get("required"), bool):
+                    errors.append(f"$.{key}[{index}].required must be boolean")
+        _require_string_list(item.get("side_effects"), "$.side_effects", errors)
+        _require_string_list(item.get("evidence_summary"), "$.evidence_summary", errors)
+        if item.get("capability_class") not in {
                 "read_sensitive",
                 "write_mutate",
                 "network_egress",
@@ -202,26 +194,20 @@ def validate_stage_output(stage: str, parsed: object) -> list[str]:
                 "auth_identity",
                 "irreversible",
             }:
-                errors.append(
-                    f"$.tool_tags.{name}.capability_class has an invalid value"
-                )
-            for key in ("is_source", "is_sink", "executes_content"):
-                if not isinstance(item.get(key), bool):
-                    errors.append(f"$.tool_tags.{name}.{key} must be boolean")
-            severity = item.get("sink_severity")
-            if isinstance(severity, bool) or not isinstance(severity, int):
-                errors.append(f"$.tool_tags.{name}.sink_severity must be an integer")
-            elif not 1 <= severity <= 5:
-                errors.append(f"$.tool_tags.{name}.sink_severity must be 1-5")
-            if item.get("delivery") not in {"direct", "data_channel"}:
-                errors.append(f"$.tool_tags.{name}.delivery has an invalid value")
-            if not isinstance(item.get("content_handling"), str):
-                errors.append(f"$.tool_tags.{name}.content_handling must be a string")
+                errors.append("$.capability_class has an invalid value")
+        for key in ("attacker_controlled_input", "high_impact_action"):
+            if not isinstance(item.get(key), bool):
+                errors.append(f"$.{key} must be boolean")
+        severity = item.get("impact_severity")
+        if isinstance(severity, bool) or not isinstance(severity, int):
+            errors.append("$.impact_severity must be an integer")
+        elif not 1 <= severity <= 5:
+            errors.append("$.impact_severity must be 1-5")
     elif stage == "EDGE_SCORE":
         edges = _require_list(root.get("edges"), "$.edges", errors)
         for index, edge in enumerate(edges):
             item = _require_mapping(edge, f"$.edges[{index}]", errors)
-            for key in ("from", "to", "data_flow"):
+            for key in ("from", "to", "producer_field", "consumer_field", "data_flow", "evidence"):
                 if not isinstance(item.get(key), str) or not item.get(key).strip():
                     errors.append(f"$.edges[{index}].{key} must be a non-empty string")
             confidence = item.get("confidence")
@@ -229,6 +215,24 @@ def validate_stage_output(stage: str, parsed: object) -> list[str]:
                 errors.append(f"$.edges[{index}].confidence must be numeric")
             elif not 0.0 <= float(confidence) <= 1.0:
                 errors.append(f"$.edges[{index}].confidence must be 0.0-1.0")
+    elif stage == "PATH_ANALYSIS":
+        if not isinstance(root.get("summary"), str):
+            errors.append("$.summary must be a string")
+        claims = _require_list(root.get("claims"), "$.claims", errors)
+        for index, claim in enumerate(claims):
+            item = _require_mapping(claim, f"$.claims[{index}]", errors)
+            if item.get("status") not in {
+                "documented",
+                "observed",
+                "hypothesis",
+                "unsupported",
+            }:
+                errors.append(f"$.claims[{index}].status has an invalid value")
+            for key in ("claim", "evidence"):
+                if not isinstance(item.get(key), str):
+                    errors.append(f"$.claims[{index}].{key} must be a string")
+        _require_string_list(root.get("attack_surfaces"), "$.attack_surfaces", errors)
+        _require_string_list(root.get("constraints"), "$.constraints", errors)
     elif stage == "EXPLOIT_HYPOTHESES":
         hypotheses = _require_list(root.get("hypotheses"), "$.hypotheses", errors)
         for index, hypothesis in enumerate(hypotheses):
@@ -440,6 +444,7 @@ def make_outcome_event(
     chain_id: str,
     step_index: int,
     target_tool: str,
+    judge_trace: object = None,
 ) -> dict:
     """Construct a victim/detector sidecar event keyed to one stage row."""
     if stage not in {"STEP_ATTACK", "STEP_EXPLOIT"}:
@@ -460,6 +465,30 @@ def make_outcome_event(
         "chain_id": chain_id,
         "step_index": int(step_index),
         "target_tool": target_tool,
+        "judge_trace": {} if judge_trace is None else judge_trace,
+    }
+
+
+def make_episode_event(
+    *,
+    sequence_number: int,
+    kind: str,
+    stage: str,
+    input_data: object,
+    output_data: object,
+    metadata: object = None,
+) -> dict:
+    """Construct one ordered, offline-renderable probe event."""
+    return {
+        "schema": "ai-sec.agent-breaker-episode-event/v1",
+        "event_id": str(uuid.uuid4()),
+        "sequence_number": int(sequence_number),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "kind": kind,
+        "stage": stage,
+        "input": _json_safe(input_data),
+        "output": _json_safe(output_data),
+        "metadata": {} if metadata is None else _json_safe(metadata),
     }
 
 

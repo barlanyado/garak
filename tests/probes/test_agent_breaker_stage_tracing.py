@@ -86,9 +86,9 @@ def _stage_probe(tmp_path, response, *, strict=True, stage="STEP_ATTACK"):
 
 def test_exact_stage_registry():
     assert STAGES == (
-        "ANALYSIS",
-        "TOOL_TAGGING",
+        "TOOL_INTERFACE_TAGGING",
         "EDGE_SCORE",
+        "PATH_ANALYSIS",
         "EXPLOIT_HYPOTHESES",
         "STEP_PLAN",
         "STEP_ATTACK",
@@ -176,11 +176,11 @@ def test_hosted_baseline_config_pins_models_routes_and_target_contract():
         },
     }
     assert probe["stage_model_routes"] == {stage: "hosted_baseline" for stage in STAGES}
-    for stage in ("TOOL_TAGGING", "EDGE_SCORE", "STEP_ATTACK"):
+    for stage in ("TOOL_INTERFACE_TAGGING", "EDGE_SCORE", "STEP_ATTACK"):
         assert probe["stage_generation_settings"][stage]["extra_params"] == {
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}
         }
-    for stage in ("ANALYSIS", "EXPLOIT_HYPOTHESES", "STEP_PLAN", "STEP_EXPLOIT"):
+    for stage in ("PATH_ANALYSIS", "EXPLOIT_HYPOTHESES", "STEP_PLAN", "STEP_EXPLOIT"):
         assert (
             probe["stage_generation_settings"][stage]["extra_params"]["extra_body"][
                 "reasoning_budget"
@@ -195,7 +195,7 @@ def test_hosted_baseline_config_pins_models_routes_and_target_contract():
 
 def test_role_loader_preserves_exact_model_identifier():
     probe = object.__new__(AgentBreakerChains)
-    probe.stage_model_routes = {"ANALYSIS": "teacher"}
+    probe.stage_model_routes = {"PATH_ANALYSIS": "teacher"}
     probe.stage_model_roles = {
         "teacher": {
             "model_type": "nvidia_inference.NVIDIAInferenceHub",
@@ -209,7 +209,7 @@ def test_role_loader_preserves_exact_model_identifier():
     expected = object()
     probe._load_model = MagicMock(return_value=expected)
 
-    role, model = probe._model_for_stage("ANALYSIS")
+    role, model = probe._model_for_stage("PATH_ANALYSIS")
 
     assert role == "teacher"
     assert model is expected
@@ -658,11 +658,11 @@ def test_step_plan_normaliser_is_disabled_for_model_only_and_attributed_for_diag
     assert observed[False][1]["fallback_used"] is False
     assert [entry["role"] for entry in observed[True][0]] == [
         "recon",
+        "recon",
         "plant",
-        "pivot",
         "exploit",
     ]
-    assert observed[True][1]["fallback_used"] is True
+    assert observed[True][1]["fallback_used"] is False
 
 
 def test_guard_prompt_fallback_is_attributed_to_originating_trace(tmp_path):

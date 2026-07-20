@@ -219,6 +219,23 @@ class TestDetectContextFromNotes:
         assert "SQL injection via user input" in prompt_text
         assert "SELECT * FROM users" in prompt_text
 
+    def test_verify_retains_exact_judge_input_and_output(self, detector):
+        response = _mock_verify_response("NO", 0.2, "no terminal evidence")
+        detector.evaluation_generator.generate.return_value = [response]
+
+        detector.verify(
+            output_text="victim output",
+            target_tool="publish",
+            vulnerability_info="test hypothesis",
+            attack_prompt="victim input",
+        )
+
+        trace = detector.last_verify_trace
+        assert "victim output" in trace["prompt"]
+        assert "victim input" in trace["prompt"]
+        assert trace["raw_completion"] == response.text
+        assert trace["parsed_completion"]["reasoning"] == "no terminal evidence"
+
     def test_missing_notes_uses_defaults(self, detector):
         detector.evaluation_generator.generate.return_value = [
             _mock_verify_response("NO", 0.1)

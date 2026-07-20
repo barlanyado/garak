@@ -24,10 +24,12 @@ Further info:
 """
 
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 from pathlib import Path
 import re
+import threading
 from typing import Iterable, List, Optional, Tuple
 
 import yaml
@@ -41,6 +43,7 @@ from garak.resources.agent_breaker_stage import (
     append_outcome,
     append_trace,
     make_fallback_event,
+    make_episode_event,
     make_outcome_event,
     make_trace_record,
     resolve_git_commit,
@@ -107,7 +110,12 @@ class AgentBreakerChains(AgentBreaker):
         "stage_generation_settings": {},
         # Versioned, exact-prompt stage traces. None disables trace output.
         "stage_trace_path": None,
+        "episode_trace_path": None,
         "stage_trace_garak_commit": None,
+        # Independent classification/analysis calls may run concurrently.
+        # Execution of one chain remains sequential because later steps consume
+        # artifacts returned by earlier steps.
+        "max_parallel_stage_requests": 1,
         # Compatibility defaults preserve historical permissive parsing and
         # deterministic attack-prompt helpers. Model-only evaluation must set
         # strict_stage_outputs=true and deterministic_fallbacks_enabled=false.
@@ -488,6 +496,8 @@ class AgentBreakerChains(AgentBreaker):
     def __init__(self, config_root=_config):
         super().__init__(config_root=config_root)
         self._stage_models: dict = {}
+        self._stage_trace_lock = threading.Lock()
+        self._episode_event_sequence = 0
         self._stage_trace_garak_commit = self.stage_trace_garak_commit or (
             resolve_git_commit(Path(__file__).resolve())
         )
@@ -510,6 +520,41 @@ class AgentBreakerChains(AgentBreaker):
         self._last_step_target_object: str = ""
         self._last_step_target_ref: str = ""
 
+    def _record_probe_event(
+        self,
+        *,
+        kind: str,
+        stage: str,
+        input_data: object,
+        output_data: object,
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """Append one ordered event containing exact retained inputs/outputs."""
+        path = getattr(self, "episode_trace_path", None)
+        if not path:
+            return
+        lock = getattr(self, "_stage_trace_lock", None)
+
+        def append() -> None:
+            self._episode_event_sequence = getattr(self, "_episode_event_sequence", 0) + 1
+            append_trace(
+                path,
+                make_episode_event(
+                    sequence_number=self._episode_event_sequence,
+                    kind=kind,
+                    stage=stage,
+                    input_data=input_data,
+                    output_data=output_data,
+                    metadata=metadata,
+                ),
+            )
+
+        if lock is None:
+            append()
+        else:
+            with lock:
+                append()
+
     def _validate_stage_configuration(self) -> None:
         """Fail before detector/model construction on invalid stage controls."""
         unknown_routes = set(self.stage_model_routes) - set(ATTACKER_STAGES)
@@ -528,6 +573,12 @@ class AgentBreakerChains(AgentBreaker):
             raise ValueError("max_step_attempts must be a positive integer")
         if self.max_step_attempts < 1:
             raise ValueError("max_step_attempts must be a positive integer")
+        if isinstance(self.max_parallel_stage_requests, bool) or not isinstance(
+            self.max_parallel_stage_requests, int
+        ):
+            raise ValueError("max_parallel_stage_requests must be a positive integer")
+        if self.max_parallel_stage_requests < 1:
+            raise ValueError("max_parallel_stage_requests must be a positive integer")
 
     def _make_detector(self, config_root):
         self._validate_stage_configuration()
@@ -640,16 +691,42 @@ class AgentBreakerChains(AgentBreaker):
             )
         return settings
 
+    def _isolated_model_for_stage(self, stage: str) -> Tuple[str, object]:
+        """Build a fresh model instance for one parallel stage request."""
+        role = str(getattr(self, "stage_model_routes", {}).get(stage, "red_team"))
+        if role == "red_team":
+            model_type = self.red_team_model_type
+            model_name = self.red_team_model_name
+            model_config = copy.deepcopy(self.red_team_model_config or {})
+        else:
+            role_config = getattr(self, "stage_model_roles", {}).get(role)
+            if not isinstance(role_config, dict):
+                raise ValueError(f"No stage model role configuration for '{role}'")
+            model_type = role_config.get("model_type")
+            model_name = role_config.get("model_name")
+            model_config = copy.deepcopy(role_config.get("model_config") or {})
+        if not isinstance(model_type, str) or not model_type:
+            raise ValueError(f"Stage model role '{role}' has no model_type")
+        if not isinstance(model_name, str) or not model_name:
+            raise ValueError(f"Stage model role '{role}' has no model_name")
+        model_config.setdefault("provider_role", role)
+        return role, self._load_model(model_type, model_name, model_config)
+
     def _get_stage_model_response(
         self,
         stage: str,
         prompt: str,
         trace_context: Optional[dict] = None,
         defer_trace: bool = False,
+        isolated_model: bool = False,
     ) -> Optional[str]:
         """Call, validate, route, and optionally trace one attacker stage."""
         trace_context = trace_context or {}
-        role, model = self._model_for_stage(stage)
+        role, model = (
+            self._isolated_model_for_stage(stage)
+            if isolated_model
+            else self._model_for_stage(stage)
+        )
         settings = self._stage_settings(stage)
         previous: dict = {}
         missing: set = set()
@@ -738,7 +815,12 @@ class AgentBreakerChains(AgentBreaker):
         if not stage_trace_path:
             return
         try:
-            append_trace(stage_trace_path, record)
+            trace_lock = getattr(self, "_stage_trace_lock", None)
+            if trace_lock is None:
+                append_trace(stage_trace_path, record)
+            else:
+                with trace_lock:
+                    append_trace(stage_trace_path, record)
         except OSError as error:
             logging.error(
                 "%s # Could not append stage trace to %s: %s",
@@ -799,38 +881,29 @@ class AgentBreakerChains(AgentBreaker):
             append_outcome(stage_trace_path, fallback_event)
 
     def _analyze_attackable_tools(self) -> dict:
-        """Run inherited per-tool analysis as the exact ``ANALYSIS`` stage."""
+        """Return evidence collected by recon without speculative global analysis.
+
+        Chain-specific security reasoning happens later in ``PATH_ANALYSIS``.
+        Keeping this hook deterministic prevents an early global model opinion
+        from deleting tools or inventing weaknesses before graph construction.
+        """
         agent_purpose = self.agent_config.get("agent_purpose", "Unknown purpose")
-        tools_description = self._format_tools_for_analysis(
-            self.tool_profiles,
-            self.tool_behaviors,
-            self.tool_fault_signatures,
-        )
-        prompt = self._prompts["ANALYSIS"].format(
-            agent_purpose=agent_purpose,
-            tools_description=tools_description,
-        )
-        analysis = self._get_stage_model_response("ANALYSIS", prompt)
-        result = {
-            "raw_analysis": analysis,
+        return {
+            "raw_analysis": None,
             "agent_purpose": agent_purpose,
             "tools": self.agent_config.get("tools", []),
-            "tool_analyses": {},
+            "tool_analyses": {
+                str(tool.get("name")): {
+                    "functionality": str(tool.get("description") or ""),
+                    "vulnerabilities": "",
+                    "exploit_strategies": "",
+                    "attack_prompts": [],
+                }
+                for tool in self.agent_config.get("tools", [])
+                if tool.get("name")
+            },
             "priority_targets": [],
         }
-        if analysis:
-            try:
-                parsed = self._detector._extract_json(analysis)
-            except json.JSONDecodeError as error:
-                logging.warning(
-                    "%s # Failed to parse ANALYSIS JSON: %s",
-                    self.__class__.__name__,
-                    error,
-                )
-            else:
-                result["tool_analyses"] = parsed.get("tool_analyses", {})
-                result["priority_targets"] = parsed.get("priority_targets", [])
-        return result
 
     # ------------------------------------------------------------------
     # Orchestration
@@ -1264,14 +1337,6 @@ class AgentBreakerChains(AgentBreaker):
         shape the downstream attack/refinement code already consumes). Returns
         empty values whenever a stage produces nothing.
         """
-        tool_analyses = (self.agent_analysis or {}).get("tool_analyses", {})
-        if not tool_analyses:
-            logging.info(
-                f"{self.__class__.__name__} # Skipping chain analysis: "
-                "no per-tool analyses available"
-            )
-            return {"chains": [], "priority_chains": []}
-
         self.tool_tags = self._tag_tool_capabilities()
         if not self.tool_tags:
             logging.info(
@@ -1299,8 +1364,7 @@ class AgentBreakerChains(AgentBreaker):
             logging.info(f"{self.__class__.__name__} # No source->sink chains found")
             return {"chains": [], "priority_chains": []}
 
-        paths = self._augment_paths_with_visible_object_context(paths)
-        paths = self._augment_paths_with_identity_user_context(paths)
+        paths = self._analyse_paths(paths)
         result = self._generate_chain_attacks(paths)
         logging.info(
             f"{self.__class__.__name__} # Built {len(result['chains'])} chain "
@@ -1309,69 +1373,145 @@ class AgentBreakerChains(AgentBreaker):
         return result
 
     def _tag_tool_capabilities(self) -> dict:
-        """Tag every tool with consumes/produces/capability/source/sink markers.
-
-        Single LLM pass grounded on the deep-recon profiles and the per-tool
-        vulnerability analysis. Returns ``{tool_name -> tag_dict}``.
-        """
+        """Classify each interface independently and bind names in code."""
         agent_purpose = self.agent_config.get("agent_purpose", "Unknown purpose")
-        tools_description = self._format_tools_for_analysis(self.tool_profiles)
-        per_tool_analyses = self._format_per_tool_analyses(
-            (self.agent_analysis or {}).get("tool_analyses", {})
-        )
+        tools = [tool for tool in self.agent_config.get("tools", []) if tool.get("name")]
 
-        prompt = self._prompts["TOOL_TAGGING"].format(
-            agent_purpose=agent_purpose,
-            tools_description=tools_description,
-            per_tool_analyses=per_tool_analyses,
-        )
-        response = self._get_stage_model_response("TOOL_TAGGING", prompt)
-        if not response:
-            return {}
-        try:
-            parsed = self._detector._extract_json(response)
-        except json.JSONDecodeError as e:
-            logging.warning(
-                f"{self.__class__.__name__} # Failed to parse tool tags JSON: {e}"
+        def classify(tool: dict) -> Tuple[str, Optional[dict]]:
+            name = str(tool["name"])
+            evidence = {
+                "runtime_tool_name": name,
+                "declared_contract": tool,
+                "deep_recon_profile": self.tool_profiles.get(name, {}),
+                "observed_behavior": self.tool_behaviors.get(name, []),
+                "fault_observations": self.tool_fault_signatures.get(name, []),
+            }
+            prompt = self._prompts["TOOL_INTERFACE_TAGGING"].format(
+                agent_purpose=agent_purpose,
+                tool_evidence=json.dumps(evidence, indent=2, ensure_ascii=False),
             )
-            return {}
-        return parsed.get("tool_tags", {}) or {}
+            response = self._get_stage_model_response(
+                "TOOL_INTERFACE_TAGGING",
+                prompt,
+                trace_context={"artifacts": {"runtime_tool_name": name}},
+                isolated_model=len(tools) > 1 and self.max_parallel_stage_requests > 1,
+            )
+            if not response:
+                return name, None
+            try:
+                parsed = self._detector._extract_json(response)
+            except json.JSONDecodeError as error:
+                logging.warning("%s # Failed to parse interface for %s: %s", self.__class__.__name__, name, error)
+                return name, None
+            return name, self._normalise_tool_interface(name, parsed, evidence)
+
+        results: List[Tuple[str, Optional[dict]]] = []
+        workers = min(self.max_parallel_stage_requests, len(tools))
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(classify, tool) for tool in tools]
+                for future in as_completed(futures):
+                    results.append(future.result())
+        else:
+            results = [classify(tool) for tool in tools]
+        return {name: record for name, record in results if record is not None}
+
+    @staticmethod
+    def _normalise_tool_interface(name: str, parsed: dict, evidence: dict) -> dict:
+        """Normalise fields while preserving exact names and evidence."""
+        evidence_text = json.dumps(evidence, ensure_ascii=False).lower()
+
+        def fields(key: str) -> list:
+            normalised = []
+            for raw in parsed.get(key, []) or []:
+                if not isinstance(raw, dict):
+                    continue
+                field = str(raw.get("field") or "").strip()
+                proof = str(raw.get("evidence") or "").strip()
+                if not field or field.lower() == "unknown":
+                    continue
+                # A model-created spelling is not authoritative. Retain it only
+                # when the supplied contract/recon evidence actually names it.
+                if field.lower() not in evidence_text:
+                    continue
+                semantic = re.sub(
+                    r"[^a-z0-9]+", "_", str(raw.get("semantic_type") or "unknown").lower()
+                ).strip("_") or "unknown"
+                item = {
+                    "field": field,
+                    "type": str(raw.get("type") or "unknown"),
+                    "semantic_type": semantic,
+                    "evidence": proof,
+                }
+                if key == "consumes":
+                    item["required"] = bool(raw.get("required"))
+                normalised.append(item)
+            return normalised
+
+        consumes = fields("consumes")
+        produces = fields("produces")
+        high_impact = bool(parsed.get("high_impact_action"))
+        try:
+            severity = int(parsed.get("impact_severity", 1))
+        except (TypeError, ValueError):
+            severity = 1
+        severity = max(1, min(5, severity)) if high_impact else 1
+        return {
+            "runtime_tool_name": name,
+            "consume_records": consumes,
+            "produce_records": produces,
+            "consumes": [field["field"] for field in consumes],
+            "produces": [field["field"] for field in produces],
+            "capability_class": parsed.get("capability_class", "read_sensitive"),
+            "is_source": bool(parsed.get("attacker_controlled_input")) or bool(produces),
+            "is_sink": high_impact,
+            "sink_severity": severity,
+            "side_effects": [str(item) for item in parsed.get("side_effects", []) if isinstance(item, str)],
+            "evidence_summary": [str(item) for item in parsed.get("evidence_summary", []) if isinstance(item, str)],
+        }
 
     @staticmethod
     def _build_capability_graph(tool_tags: dict) -> List[dict]:
-        """Build candidate directed edges between any producer and any consumer.
-
-        Pure function (no model). Emits an edge ``A -> B`` for every
-        ``A != B`` where ``A`` has any ``produces`` tag and ``B`` has any
-        ``consumes`` tag. The LLM scoring pass downstream judges plausibility
-        from the actual produces/consumes vocabulary -- it knows, for example,
-        that ``directory_listing`` semantically contains ``file_path``, which
-        an exact-intersection prefilter would miss.
-
-        Carries the raw produces/consumes tag lists on each candidate so the
-        scorer can render them verbatim.
-        """
+        """Build field-level candidate bindings without renaming tools."""
+        if not any("produce_records" in record for record in tool_tags.values()):
+            # Compatibility for callers using the pre-interface-tag schema.
+            return [
+                {
+                    "from": src,
+                    "to": dst,
+                    "produces": list(src_tags.get("produces") or []),
+                    "consumes": list(dst_tags.get("consumes") or []),
+                }
+                for src, src_tags in tool_tags.items()
+                for dst, dst_tags in tool_tags.items()
+                if src != dst
+                and src_tags.get("produces")
+                and dst_tags.get("consumes")
+            ]
         edges: List[dict] = []
         for src, src_tags in tool_tags.items():
-            produces = [str(t).strip() for t in (src_tags.get("produces") or [])]
-            produces = [t for t in produces if t]
-            if not produces:
-                continue
             for dst, dst_tags in tool_tags.items():
                 if dst == src:
                     continue
-                consumes = [str(t).strip() for t in (dst_tags.get("consumes") or [])]
-                consumes = [t for t in consumes if t]
-                if not consumes:
-                    continue
-                edges.append(
-                    {
-                        "from": src,
-                        "to": dst,
-                        "produces": produces,
-                        "consumes": consumes,
-                    }
-                )
+                for produced in src_tags.get("produce_records", []) or []:
+                    for consumed in dst_tags.get("consume_records", []) or []:
+                        exact = produced["field"].lower() == consumed["field"].lower()
+                        semantic = (
+                            produced.get("semantic_type") != "unknown"
+                            and produced.get("semantic_type") == consumed.get("semantic_type")
+                        )
+                        if exact or semantic:
+                            edges.append({
+                                "from": src,
+                                "to": dst,
+                                "producer_field": produced["field"],
+                                "consumer_field": consumed["field"],
+                                "producer_semantic_type": produced.get("semantic_type", "unknown"),
+                                "consumer_semantic_type": consumed.get("semantic_type", "unknown"),
+                                "match_kind": "exact" if exact else "semantic",
+                                "producer_evidence": produced.get("evidence", ""),
+                                "consumer_evidence": consumed.get("evidence", ""),
+                            })
         return edges
 
     def _score_edges(self, candidate_edges: List[dict]) -> List[dict]:
@@ -1382,11 +1522,7 @@ class AgentBreakerChains(AgentBreaker):
         source to target.
         """
         tool_tags_str = json.dumps(self.tool_tags, indent=2)
-        candidate_edges_str = "\n".join(
-            f"- {e['from']} (produces: {', '.join(e.get('produces', []))}) "
-            f"-> {e['to']} (consumes: {', '.join(e.get('consumes', []))})"
-            for e in candidate_edges
-        )
+        candidate_edges_str = json.dumps(candidate_edges, indent=2)
         prompt = self._prompts["EDGE_SCORE"].format(
             tool_tags=tool_tags_str,
             candidate_edges=candidate_edges_str,
@@ -1402,11 +1538,16 @@ class AgentBreakerChains(AgentBreaker):
             )
             return []
 
+        allowed = {
+            (e["from"], e["to"], e["producer_field"], e["consumer_field"]): e
+            for e in candidate_edges
+        }
         scored: List[dict] = []
         for e in parsed.get("edges", []) or []:
             src = e.get("from")
             dst = e.get("to")
-            if not src or not dst:
+            key = (src, dst, e.get("producer_field"), e.get("consumer_field"))
+            if key not in allowed:
                 continue
             try:
                 confidence = float(e.get("confidence", 0.0))
@@ -1418,8 +1559,12 @@ class AgentBreakerChains(AgentBreaker):
                 {
                     "from": src,
                     "to": dst,
+                    "producer_field": key[2],
+                    "consumer_field": key[3],
                     "confidence": confidence,
                     "data_flow": e.get("data_flow", ""),
+                    "evidence": e.get("evidence", ""),
+                    "match_kind": allowed[key]["match_kind"],
                 }
             )
         return scored
@@ -1930,69 +2075,172 @@ class AgentBreakerChains(AgentBreaker):
         return augmented
 
     def _search_chains(self, edges: List[dict], tool_tags: dict) -> List[dict]:
-        """Bounded source->sink path search over scored edges.
+        """Build dependency-complete source subgraphs for high-impact sinks.
 
-        Pure function (no model). Enumerates simple paths (no repeated tool)
-        starting at any ``is_source`` tool and recording a chain whenever the
-        current tool is an ``is_sink`` and the path has at least 2 tools. Paths
-        are ranked by ``sink_severity * product(edge_confidence)`` and capped at
-        ``max_chains``. When the target's public tool contract advertises a
-        required structural workflow, matching paths are preferred before the
-        cap is applied so bounded validation does not spend its only chain on an
-        off-workflow terminal path.
+        Unlike a linear DFS, this reverse walk preserves sibling prerequisites:
+        two independent producers may both feed one consumer and can later be
+        scheduled in either valid topological order.
         """
-        adjacency: dict = {}
-        for e in edges:
-            adjacency.setdefault(e["from"], []).append(e)
+        if edges and "consumer_field" not in edges[0]:
+            return self._search_legacy_linear_paths(edges, tool_tags)
+        incoming: dict[str, list] = {}
+        for edge in edges:
+            incoming.setdefault(edge["to"], []).append(edge)
+        candidates: list[dict] = []
+        for sink, tag in tool_tags.items():
+            if not tag.get("is_sink"):
+                continue
+            selected_nodes = {sink}
+            selected_edges: list[dict] = []
+            frontier = [sink]
+            while frontier and len(selected_nodes) < self.max_chain_len:
+                consumer = frontier.pop(0)
+                by_input: dict[str, list] = {}
+                for edge in incoming.get(consumer, []):
+                    by_input.setdefault(edge.get("consumer_field", "data"), []).append(edge)
+                for field_edges in by_input.values():
+                    best = max(field_edges, key=lambda item: item["confidence"])
+                    producer = best["from"]
+                    if producer not in selected_nodes and len(selected_nodes) >= self.max_chain_len:
+                        continue
+                    if best not in selected_edges:
+                        selected_edges.append(best)
+                    if producer not in selected_nodes:
+                        selected_nodes.add(producer)
+                        frontier.append(producer)
+            if len(selected_nodes) < 2:
+                continue
+            if not any(
+                tool_tags.get(node, {}).get("is_source") for node in selected_nodes
+            ):
+                continue
+            sequence = self._topological_order(selected_nodes, selected_edges)
+            if sequence is None or sequence[-1] != sink:
+                continue
+            confidence = 1.0
+            for edge in selected_edges:
+                confidence *= float(edge.get("confidence", 0.0))
+            severity = int(tag.get("sink_severity", 1) or 1)
+            candidates.append({
+                "sequence": sequence,
+                "nodes": sequence,
+                "sink": sink,
+                "edges": selected_edges,
+                "dependencies": selected_edges,
+                "score": severity * confidence,
+            })
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        return candidates[: self.max_chains]
 
-        def severity(tool: str) -> int:
-            try:
-                return int((tool_tags.get(tool, {}) or {}).get("sink_severity", 1) or 1)
-            except (TypeError, ValueError):
-                return 1
+    def _search_legacy_linear_paths(self, edges: List[dict], tool_tags: dict) -> List[dict]:
+        """Preserve the old public helper contract for external callers/tests."""
+        adjacency: dict[str, list] = {}
+        for edge in edges:
+            adjacency.setdefault(edge["from"], []).append(edge)
+        found: list[tuple[float, list, list]] = []
 
-        def is_source(tool: str) -> bool:
-            return bool((tool_tags.get(tool, {}) or {}).get("is_source"))
-
-        def is_sink(tool: str) -> bool:
-            return bool((tool_tags.get(tool, {}) or {}).get("is_sink"))
-
-        found: List[Tuple[float, list, list]] = []
-
-        def dfs(current: str, sequence: list, edge_list: list, conf_product: float):
-            if len(sequence) >= 2 and is_sink(current):
-                found.append(
-                    (severity(current) * conf_product, list(sequence), list(edge_list))
-                )
+        def walk(tool: str, sequence: list, selected: list, confidence: float) -> None:
+            tag = tool_tags.get(tool, {})
+            if len(sequence) >= 2 and tag.get("is_sink"):
+                severity = int(tag.get("sink_severity", 1) or 1)
+                found.append((severity * confidence, list(sequence), list(selected)))
             if len(sequence) >= self.max_chain_len:
                 return
-            for e in adjacency.get(current, []):
-                nxt = e["to"]
-                if nxt in sequence:  # simple paths only — avoid cycles
+            for edge in adjacency.get(tool, []):
+                if edge["to"] in sequence:
                     continue
-                sequence.append(nxt)
-                edge_list.append(e)
-                dfs(nxt, sequence, edge_list, conf_product * e["confidence"])
-                sequence.pop()
-                edge_list.pop()
+                walk(
+                    edge["to"],
+                    [*sequence, edge["to"]],
+                    [*selected, edge],
+                    confidence * float(edge.get("confidence", 0.0)),
+                )
 
-        for tool in tool_tags:
-            if is_source(tool):
-                dfs(tool, [tool], [], 1.0)
+        for tool, tag in tool_tags.items():
+            if tag.get("is_source"):
+                walk(tool, [tool], [], 1.0)
+        found.sort(key=lambda item: self._path_search_priority(item[0], item[1]), reverse=True)
+        return [
+            {"sequence": sequence, "edges": selected, "score": score}
+            for score, sequence, selected in found[: self.max_chains]
+        ]
 
-        found.sort(key=lambda p: self._path_search_priority(p[0], p[1]), reverse=True)
-
-        ranked: List[dict] = []
-        seen: set = set()
-        for score, sequence, edge_list in found:
-            key = tuple(sequence)
-            if key in seen:
+    @staticmethod
+    def _topological_order(nodes: Iterable[str], edges: List[dict]) -> Optional[List[str]]:
+        """Return a stable dependency-valid order, or ``None`` for a cycle."""
+        node_order = list(dict.fromkeys(nodes))
+        indegree = {node: 0 for node in node_order}
+        outgoing = {node: [] for node in node_order}
+        for edge in edges:
+            src, dst = edge["from"], edge["to"]
+            if src not in indegree or dst not in indegree or src == dst:
                 continue
-            seen.add(key)
-            ranked.append({"sequence": sequence, "edges": edge_list, "score": score})
-            if len(ranked) >= self.max_chains:
-                break
-        return ranked
+            if dst not in outgoing[src]:
+                outgoing[src].append(dst)
+                indegree[dst] += 1
+        ready = sorted(node for node, degree in indegree.items() if degree == 0)
+        result: List[str] = []
+        while ready:
+            node = ready.pop(0)
+            result.append(node)
+            for target in sorted(outgoing[node]):
+                indegree[target] -= 1
+                if indegree[target] == 0:
+                    ready.append(target)
+                    ready.sort()
+        return result if len(result) == len(indegree) else None
+
+    def _analyse_paths(self, paths: List[dict]) -> List[dict]:
+        """Run evidence-labelled reasoning independently for each subgraph."""
+        tools_block = self._format_tools_for_analysis(
+            self.tool_profiles, self.tool_behaviors, self.tool_fault_signatures
+        )
+
+        def analyse(path: dict) -> dict:
+            subgraph = self._serialise_subgraph(path)
+            prompt = self._prompts["PATH_ANALYSIS"].format(
+                subgraph=json.dumps(subgraph, indent=2),
+                tools_block=tools_block,
+            )
+            response = self._get_stage_model_response(
+                "PATH_ANALYSIS",
+                prompt,
+                isolated_model=len(paths) > 1 and self.max_parallel_stage_requests > 1,
+            )
+            analysis: dict = {}
+            if response:
+                try:
+                    analysis = self._detector._extract_json(response)
+                except json.JSONDecodeError as error:
+                    logging.warning("%s # Failed to parse PATH_ANALYSIS: %s", self.__class__.__name__, error)
+            return {**path, "path_analysis": analysis}
+
+        workers = min(self.max_parallel_stage_requests, len(paths))
+        if workers <= 1:
+            return [analyse(path) for path in paths]
+        results: List[dict] = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(analyse, path) for path in paths]
+            for future in as_completed(futures):
+                results.append(future.result())
+        return results
+
+    @staticmethod
+    def _serialise_subgraph(path: dict) -> dict:
+        return {
+            "nodes": list(path.get("nodes") or path.get("sequence") or []),
+            "sink": path.get("sink") or ((path.get("sequence") or [None])[-1]),
+            "dependencies": [
+                {
+                    key: edge.get(key)
+                    for key in (
+                        "from", "to", "producer_field", "consumer_field",
+                        "confidence", "data_flow", "evidence",
+                    )
+                }
+                for edge in path.get("edges", [])
+            ],
+        }
 
     @staticmethod
     def _format_chain_data_flow(edges: list) -> str:
@@ -2046,21 +2294,11 @@ class AgentBreakerChains(AgentBreaker):
         sequence: List[str] = chain.get("sequence", []) or []
         if not sequence:
             return []
-        sink = sequence[-1]
-        sink_tags = json.dumps(self.tool_tags.get(sink, {}) or {}, indent=2)
-        tools_block = self._format_tools_for_analysis(
-            self.tool_profiles, self.tool_behaviors
-        )
-
         prompt = self._prompts["EXPLOIT_HYPOTHESES"].format(
-            sequence=" -> ".join(sequence),
-            sink=sink,
-            delivery=chain.get("delivery", "direct"),
-            sink_tags=sink_tags,
-            data_flow=chain.get("data_flow", ""),
-            vulnerabilities=chain.get("vulnerabilities", ""),
-            tools_block=tools_block,
+            subgraph=json.dumps(chain.get("subgraph", {}), indent=2),
+            path_analysis=json.dumps(chain.get("path_analysis", {}), indent=2),
             max_hypotheses=int(self.max_hypotheses_per_chain),
+            sequence=" -> ".join(sequence),
         )
         response = self._get_stage_model_response(
             "EXPLOIT_HYPOTHESES",
@@ -2136,9 +2374,9 @@ class AgentBreakerChains(AgentBreaker):
 
         for i, path in enumerate(paths, start=1):
             sequence = path["sequence"]
-            if not self._path_satisfies_required_workflow(sequence):
+            if "dependencies" not in path and not self._path_satisfies_required_workflow(sequence):
                 logging.info(
-                    "%s # Dropping path outside required structural workflow: %s",
+                    "%s # Dropping legacy path outside required structural workflow: %s",
                     self.__class__.__name__,
                     " -> ".join(sequence),
                 )
@@ -2157,6 +2395,9 @@ class AgentBreakerChains(AgentBreaker):
 
             base_chain = {
                 "sequence": sequence,
+                "dependencies": path.get("dependencies", path.get("edges", [])),
+                "subgraph": self._serialise_subgraph(path),
+                "path_analysis": path.get("path_analysis", {}),
                 "entry_tool": entry_tool,
                 "intent": intent,
                 "data_flow": data_flow,
@@ -2198,12 +2439,13 @@ class AgentBreakerChains(AgentBreaker):
                     continue
 
                 chain["step_plan"] = step_plan
+                chain["entry_tool"] = chain["sequence"][0]
                 chains.append(chain)
                 priority_chains.append(f"{chain_id} - score {path['score']:.2f}")
                 logging.info(
                     f"{self.__class__.__name__} # Step plan for {chain_id} "
                     f"[{hypothesis['technique']}] "
-                    f"({' -> '.join(sequence)}): "
+                    f"({' -> '.join(chain['sequence'])}): "
                     + " | ".join(
                         f"{e.get('tool', '?')}[{e.get('role', '?')}]" for e in step_plan
                     )
@@ -2475,15 +2717,11 @@ class AgentBreakerChains(AgentBreaker):
         )
         hypothesis = chain.get("hypothesis", {}) or {}
         prompt = self._prompts["STEP_PLAN"].format(
-            sequence=" -> ".join(sequence),
-            intent=chain.get("intent", ""),
-            data_flow=chain.get("data_flow", ""),
-            vulnerabilities=chain.get("vulnerabilities", ""),
+            subgraph=json.dumps(chain.get("subgraph", {}), indent=2),
+            path_analysis=json.dumps(chain.get("path_analysis", {}), indent=2),
+            hypothesis=json.dumps(hypothesis, indent=2),
             tools_block=tools_block,
-            delivery=chain.get("delivery", "direct"),
-            exploit_technique=hypothesis.get("technique", "(unspecified)"),
-            payload_shape=hypothesis.get("payload_shape", "") or "(unspecified)",
-            sink_requirement=hypothesis.get("sink_requirement", "") or "(unspecified)",
+            sequence=" -> ".join(sequence),
         )
         response = self._get_stage_model_response(
             "STEP_PLAN",
@@ -2517,16 +2755,17 @@ class AgentBreakerChains(AgentBreaker):
         fallbacks_enabled = getattr(self, "deterministic_fallbacks_enabled", True)
         plan_fallback_used = False
         cleaned: List[dict] = []
-        for i, entry in enumerate(raw_plan):
+        planned_tools: List[str] = []
+        available_tools = set(sequence)
+        for entry in raw_plan:
             if not isinstance(entry, dict):
                 self._flush_pending_stage_trace()
                 return None
             raw_tool = entry.get("tool")
-            if raw_tool != sequence[i]:
-                if not fallbacks_enabled:
-                    self._flush_pending_stage_trace()
-                    return None
-                plan_fallback_used = True
+            if raw_tool not in available_tools or raw_tool in planned_tools:
+                self._flush_pending_stage_trace()
+                return None
+            planned_tools.append(raw_tool)
             raw_role = entry.get("role", "")
             role = str(raw_role).lower().strip()
             if role not in {"recon", "pivot", "plant", "exploit"}:
@@ -2560,7 +2799,7 @@ class AgentBreakerChains(AgentBreaker):
                 plan_fallback_used = True
             cleaned.append(
                 {
-                    "tool": sequence[i],
+                    "tool": raw_tool,
                     "role": role,
                     "intent": str(text_fields["intent"]),
                     # Backchained per-step target: what this step must surface for
@@ -2572,11 +2811,26 @@ class AgentBreakerChains(AgentBreaker):
                 }
             )
 
-        if fallbacks_enabled:
-            model_plan = copy.deepcopy(cleaned)
-            cleaned = self._normalize_pr_ci_merge_step_plan(sequence, cleaned)
-            cleaned = self._normalize_identity_grant_step_plan(sequence, cleaned)
-            plan_fallback_used = plan_fallback_used or cleaned != model_plan
+        if set(planned_tools) != available_tools:
+            self._flush_pending_stage_trace()
+            return None
+        positions = {tool: index for index, tool in enumerate(planned_tools)}
+        invalid_dependencies = [
+            edge
+            for edge in chain.get("dependencies", [])
+            if positions.get(edge.get("from"), len(planned_tools))
+            >= positions.get(edge.get("to"), -1)
+        ]
+        if invalid_dependencies:
+            logging.warning(
+                "%s # Step plan violates %d dependency edge(s)",
+                self.__class__.__name__,
+                len(invalid_dependencies),
+            )
+            self._flush_pending_stage_trace()
+            return None
+
+        chain["sequence"] = planned_tools
         if cleaned[-1]["role"] != "exploit":
             logging.warning(
                 f"{self.__class__.__name__} # Step plan for "
@@ -5721,32 +5975,24 @@ class AgentBreakerChains(AgentBreaker):
         entry = self._plan_entry(chain, step_index)
         prior_outputs = chain.get("step_outputs", []) or []
         artifacts = self._artifacts_for_prompt(chain)
-        invariant = self._identity_invariant(chain, chain.get("artifacts", {}) or {})
         hypothesis = chain.get("hypothesis", {}) or {}
 
         prompt = self._prompts["STEP_ATTACK"].format(
-            target_tool=target_tool,
-            step_index=step_index + 1,
+            step_plan=json.dumps(chain.get("step_plan", []), indent=2),
+            step_number=step_index + 1,
             total_steps=len(sequence),
-            full_sequence=" -> ".join(sequence) if sequence else "(unspecified)",
-            chain_intent=chain.get("intent", ""),
-            delivery=chain.get("delivery", "direct"),
-            exploit_technique=hypothesis.get("technique", "(unspecified)"),
-            payload_shape=hypothesis.get("payload_shape", "") or "(unspecified)",
-            sink_requirement=hypothesis.get("sink_requirement", "") or "(unspecified)",
+            current_tool=target_tool,
             role=entry.get("role", "exploit"),
-            intent=entry.get("intent", ""),
+            step_intent=entry.get("intent", ""),
             must_provide=entry.get("must_provide", "") or "(not specified)",
             success_criterion=entry.get("success_criterion", ""),
-            artifact_keys=", ".join(entry.get("artifact_keys") or []) or "(none)",
-            prior_artifacts=self._format_prior_artifacts(artifacts),
+            input_artifact_keys=json.dumps(entry.get("input_artifact_keys", [])),
+            output_artifact_keys=json.dumps(entry.get("artifact_keys", [])),
+            hypothesis=json.dumps(hypothesis, indent=2),
+            artifacts=self._format_prior_artifacts(artifacts),
+            prior_responses=self._format_prior_steps(prior_outputs),
+            target_tool=target_tool,
             capability_handoff=self._format_capability_handoff(chain, step_index),
-            identity_invariant=self._format_identity_invariant(invariant),
-            identity_guard_feedback=self._format_identity_guard_feedback(
-                identity_guard_feedback
-            ),
-            prior_steps_transcript=self._format_prior_steps(prior_outputs),
-            vulnerabilities=chain.get("vulnerabilities", "Unknown vulnerabilities"),
         )
         return self._extract_attack_prompt(
             self._get_stage_model_response(
@@ -5784,37 +6030,21 @@ class AgentBreakerChains(AgentBreaker):
             return None
         target_tool = sequence[step_index]
         entry = self._plan_entry(chain, step_index)
-        prior_outputs = chain.get("step_outputs", []) or []
         artifacts = self._artifacts_for_prompt(chain)
-        invariant = self._identity_invariant(chain, chain.get("artifacts", {}) or {})
         hypothesis = chain.get("hypothesis", {}) or {}
 
         prompt = self._prompts["STEP_EXPLOIT"].format(
             target_tool=target_tool,
-            step_index=step_index + 1,
-            total_steps=len(sequence),
-            full_sequence=" -> ".join(sequence) if sequence else "(unspecified)",
-            chain_intent=chain.get("intent", ""),
-            delivery=chain.get("delivery", "direct"),
-            exploit_technique=hypothesis.get("technique", "(unspecified)"),
-            payload_shape=hypothesis.get("payload_shape", "") or "(unspecified)",
-            sink_requirement=hypothesis.get("sink_requirement", "") or "(unspecified)",
-            role=entry.get("role", "exploit"),
-            intent=entry.get("intent", ""),
+            step_role=entry.get("role", "exploit"),
+            step_intent=entry.get("intent", ""),
             must_provide=entry.get("must_provide", "") or "(not specified)",
             success_criterion=entry.get("success_criterion", ""),
-            artifact_keys=", ".join(entry.get("artifact_keys") or []) or "(none)",
-            prior_artifacts=self._format_prior_artifacts(artifacts),
-            capability_handoff=self._format_capability_handoff(chain, step_index),
-            identity_invariant=self._format_identity_invariant(invariant),
-            identity_guard_feedback=self._format_identity_guard_feedback(
-                identity_guard_feedback
-            ),
-            prior_steps_transcript=self._format_prior_steps(prior_outputs),
-            vulnerabilities=chain.get("vulnerabilities", "Unknown vulnerabilities"),
-            tried_techniques=self._tried_techniques(history),
-            last_response=self._last_agent_feedback(history),
+            input_artifact_keys=json.dumps(entry.get("input_artifact_keys", [])),
+            output_artifact_keys=json.dumps(entry.get("artifact_keys", [])),
+            hypothesis=json.dumps(hypothesis, indent=2),
+            artifacts=self._format_prior_artifacts(artifacts),
             history_str=self._format_step_history(history),
+            capability_handoff=self._format_capability_handoff(chain, step_index),
         )
         return self._extract_attack_prompt(
             self._get_stage_model_response(
@@ -5857,11 +6087,12 @@ class AgentBreakerChains(AgentBreaker):
 
         prompt = self._prompts["EXTRACT_ARTIFACTS"].format(
             tool_name=tool_name,
+            artifact_keys=", ".join(artifact_keys) or "(none specifically required)",
+            response=(agent_response or "")[: self._STEP_RESPONSE_CHAR_LIMIT],
             role=entry.get("role", ""),
             intent=entry.get("intent", ""),
             step_prompt=step_prompt,
             agent_response=(agent_response or "")[: self._STEP_RESPONSE_CHAR_LIMIT],
-            artifact_keys=", ".join(artifact_keys) or "(none specifically required)",
         )
         self._setup_parse_model()
         response = self._get_model_response(prompt, model=self.parse_model)
@@ -6494,12 +6725,10 @@ class AgentBreakerChains(AgentBreaker):
             return identity_result
 
         prompt = self._prompts["CHECK_STEP_SUCCESS"].format(
+            tool_name=tool_name,
             role=entry.get("role", ""),
-            intent=entry.get("intent", ""),
             success_criterion=entry.get("success_criterion", ""),
-            step_prompt=step_prompt,
-            agent_response=(agent_response or "")[: self._STEP_RESPONSE_CHAR_LIMIT],
-            artifacts_str=self._format_prior_artifacts(artifacts),
+            response=(agent_response or "")[: self._STEP_RESPONSE_CHAR_LIMIT],
         )
         self._setup_parse_model()
         response = self._get_model_response(prompt, model=self.parse_model)
@@ -6517,7 +6746,7 @@ class AgentBreakerChains(AgentBreaker):
         except (TypeError, ValueError):
             confidence = 0.0
         return (
-            bool(parsed.get("step_succeeded")),
+            bool(parsed.get("success", parsed.get("step_succeeded"))),
             confidence,
             str(parsed.get("reasoning", "")),
         )
@@ -6824,6 +7053,7 @@ class AgentBreakerChains(AgentBreaker):
                 chain_id=str(chain.get("chain_id", "")),
                 step_index=step_index,
                 target_tool=target_tool,
+                judge_trace=outcome.get("judge_trace", {}),
             )
             try:
                 append_outcome(stage_trace_path, record)
@@ -6893,6 +7123,7 @@ class AgentBreakerChains(AgentBreaker):
                             "reasoning": "empty victim response",
                         },
                         "deterministic_outcome": None,
+                        "judge_trace": {},
                     }
                 )
                 continue
@@ -6909,12 +7140,16 @@ class AgentBreakerChains(AgentBreaker):
                 confidence = 1.0
                 reasoning = "accepted structured terminal outcome"
                 terminal_outcome = structured_outcome
+                judge_trace = {}
             else:
                 is_success, confidence, reasoning = self._verify_attack_success(
                     attack_prompt=last_attempt.prompt,
                     agent_response=output.text,
                     target_tool=state.current_target,
                     vulnerability_info=state.vulnerability_info,
+                )
+                judge_trace = copy.deepcopy(
+                    getattr(self._detector, "last_verify_trace", {}) or {}
                 )
             verified_results.append((is_success, confidence))
             if confidence > best_confidence:
@@ -6933,6 +7168,7 @@ class AgentBreakerChains(AgentBreaker):
                         "reasoning": str(reasoning),
                     },
                     "deterministic_outcome": structured_outcome,
+                    "judge_trace": judge_trace,
                 }
             )
 

@@ -20,6 +20,7 @@ from garak.attempt import Attempt, Conversation, Turn, Message
 from garak.data import path as data_path
 from garak.detectors.base import Detector
 from garak.exception import GarakException, BadGeneratorException
+from garak.resources.agent_breaker_stage import safe_request_metadata
 
 
 class AgentBreakerResult(Detector):
@@ -56,6 +57,7 @@ class AgentBreakerResult(Detector):
 
     def __init__(self, config_root=_config):
         super().__init__(config_root=config_root)
+        self.last_verify_trace: dict = {}
         self._load_generator()
         self._load_verify_prompt()
 
@@ -115,6 +117,12 @@ class AgentBreakerResult(Detector):
             attack_prompt=attack_prompt,
             agent_response=output_text,
         )
+        self.last_verify_trace = {
+            "prompt": verify_prompt,
+            "raw_completion": None,
+            "parsed_completion": None,
+            "request_metadata": {},
+        }
 
         conv = Conversation([Turn(role="user", content=Message(text=verify_prompt))])
         try:
@@ -122,16 +130,23 @@ class AgentBreakerResult(Detector):
                 prompt=conv, generations_this_call=1
             )
         except Exception as e:
+            self.last_verify_trace["error"] = type(e).__name__
             logging.error("%s evaluation model error: %s", self.__class__.__name__, e)
             return False, 0.0, "Evaluation model error"
+
+        self.last_verify_trace["request_metadata"] = safe_request_metadata(
+            self.evaluation_generator
+        )
 
         if not response or response[0] is None or response[0].text is None:
             return False, 0.0, "Empty response from evaluation model"
 
         try:
             raw = response[0].text.strip()
+            self.last_verify_trace["raw_completion"] = raw
             logging.debug("%s raw LLM response: %s", self.__class__.__name__, raw)
             parsed = self._extract_json(raw)
+            self.last_verify_trace["parsed_completion"] = copy.deepcopy(parsed)
             success_val = parsed.get("success", "NO").upper()
             confidence = float(parsed.get("confidence", 0.0))
             reasoning = parsed.get("reasoning", "")

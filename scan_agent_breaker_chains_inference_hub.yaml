@@ -42,13 +42,15 @@ plugins:
         strict_stage_outputs: true
         deterministic_fallbacks_enabled: false
         stage_trace_path: artifacts/baseline_codereview_hosted_nano/stages.jsonl
+        episode_trace_path: artifacts/baseline_codereview_hosted_nano/episode.events.jsonl
+        max_parallel_stage_requests: 4
 
         red_team_model_type: nvidia_inference.NVIDIAInferenceHub
         red_team_model_name: nvidia/nvidia/Nemotron-3-Nano-30B-A3B
         red_team_model_config:
           uri: https://inference-api.nvidia.com/v1/
           provider_role: hosted_baseline
-          max_retries: 2
+          max_retries: 0
 
         parse_model_type: nvidia_inference.NVIDIAInferenceHub
         parse_model_name: nvidia/nvidia/Nemotron-3-Nano-30B-A3B
@@ -57,7 +59,7 @@ plugins:
           provider_role: utility_parser
           temperature: 0.0
           max_tokens: 4096
-          max_retries: 2
+          max_retries: 0
           extra_params:
             extra_body:
               chat_template_kwargs:
@@ -69,13 +71,13 @@ plugins:
             model_name: nvidia/nvidia/Nemotron-3-Nano-30B-A3B
             model_config:
               uri: https://inference-api.nvidia.com/v1/
-              max_retries: 2
+              max_retries: 0
           teacher:
             model_type: nvidia_inference.NVIDIAInferenceHub
             model_name: nvidia/zai-org/glm-5.2
             model_config:
               uri: https://inference-api.nvidia.com/v1/
-              max_retries: 2
+              max_retries: 0
           local_base:
             model_type: nvidia_inference.LocalOpenAICompatible
             model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
@@ -93,23 +95,16 @@ plugins:
                 - stop
 
         stage_model_routes:
-          ANALYSIS: hosted_baseline
-          TOOL_TAGGING: hosted_baseline
+          TOOL_INTERFACE_TAGGING: hosted_baseline
           EDGE_SCORE: hosted_baseline
+          PATH_ANALYSIS: hosted_baseline
           EXPLOIT_HYPOTHESES: hosted_baseline
           STEP_PLAN: hosted_baseline
           STEP_ATTACK: hosted_baseline
           STEP_EXPLOIT: hosted_baseline
 
         stage_generation_settings:
-          ANALYSIS:
-            temperature: 1.0
-            top_p: 1.0
-            max_tokens: 16384
-            extra_params:
-              extra_body:
-                reasoning_budget: 16384
-          TOOL_TAGGING:
+          TOOL_INTERFACE_TAGGING:
             temperature: 0.0
             top_p: 1.0
             max_tokens: 4096
@@ -125,6 +120,13 @@ plugins:
               extra_body:
                 chat_template_kwargs:
                   enable_thinking: false
+          PATH_ANALYSIS:
+            temperature: 1.0
+            top_p: 1.0
+            max_tokens: 16384
+            extra_params:
+              extra_body:
+                reasoning_budget: 16384
           EXPLOIT_HYPOTHESES:
             temperature: 1.0
             top_p: 1.0
@@ -159,14 +161,10 @@ plugins:
     agent_breaker_chains:
       AgentBreakerChainResult:
         detector_model_type: nvidia_inference.NVIDIAInferenceHub
-        detector_model_name: nvidia/nvidia/Nemotron-3-Nano-30B-A3B
+        detector_model_name: openai/openai/gpt-5.2
         detector_model_config:
           uri: https://inference-api.nvidia.com/v1/
-          provider_role: utility_parser
+          provider_role: judge
           temperature: 0.0
           max_tokens: 1024
-          max_retries: 2
-          extra_params:
-            extra_body:
-              chat_template_kwargs:
-                enable_thinking: false
+          max_retries: 0

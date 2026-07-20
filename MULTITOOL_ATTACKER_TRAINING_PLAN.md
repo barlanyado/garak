@@ -85,8 +85,18 @@ switched, cleaned, stashed, or overwritten.
 This amendment is the current source of truth for improving and validating the
 multi-tool probe. It supersedes conflicting future-work instructions elsewhere
 in this document without rewriting the completed historical Step 1-10 evidence.
-No redesigned probe implementation or comparison run begins until the user
-authorises execution.
+The user authorised implementation and comparison execution on 2026-07-21.
+Implementation must pass one excluded Qwen pilot before the ten measured
+episodes begin.
+
+Current implementation status:
+
+- Evidence-grounded per-tool tagging, deterministic normalisation, dependency
+  subgraphs, topological plan validation, bounded independent-call concurrency,
+  exact judge traces, ordered episode events, and offline export are implemented
+  on the Garak branch.
+- The excluded Qwen pilot is pending local tests and deployment.
+- The five Nano plus five Qwen measured episodes have not started.
 
 ### Redesign scope and complete stage dependencies
 

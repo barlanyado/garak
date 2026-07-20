@@ -78,6 +78,12 @@ plugins:
             model_config:
               uri: https://inference-api.nvidia.com/v1/
               max_retries: 0
+          hosted_qwen:
+            model_type: nvidia_inference.NVIDIAInferenceHub
+            model_name: nvidia/qwen/qwen-235b
+            model_config:
+              uri: https://inference-api.nvidia.com/v1/
+              max_retries: 0
           local_base:
             model_type: nvidia_inference.LocalOpenAICompatible
             model_name: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16

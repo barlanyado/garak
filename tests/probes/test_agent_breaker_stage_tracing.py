@@ -166,6 +166,9 @@ def test_hosted_baseline_config_pins_models_routes_and_target_contract():
     assert probe["stage_model_roles"]["teacher"]["model_name"] == (
         "nvidia/zai-org/glm-5.2"
     )
+    assert probe["stage_model_roles"]["hosted_qwen"]["model_name"] == (
+        "nvidia/qwen/qwen-235b"
+    )
     assert probe["stage_model_roles"]["local_base"] == {
         "model_type": "nvidia_inference.LocalOpenAICompatible",
         "model_name": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",

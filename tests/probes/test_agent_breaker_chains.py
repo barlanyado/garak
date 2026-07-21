@@ -12,7 +12,6 @@ from unittest.mock import MagicMock, patch
 from garak.probes.agent_breaker import AgentBreaker, AttackState
 from garak.probes.agent_breaker_chains import AgentBreakerChains
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -559,7 +558,9 @@ class TestRequiredWorkflowSelection:
             ["place_order", "process_payment"]
         )
 
-    def test_customer_order_refund_contract_detected_from_public_tool_descriptions(self):
+    def test_customer_order_refund_contract_detected_from_public_tool_descriptions(
+        self,
+    ):
         probe = _make_probe()
         probe.agent_config = _support_chain_required_config()
 
@@ -568,7 +569,9 @@ class TestRequiredWorkflowSelection:
             ("lookup_customer", "lookup_order", "issue_refund"),
         )
 
-    def test_base_support_contract_does_not_require_customer_order_refund_workflow(self):
+    def test_base_support_contract_does_not_require_customer_order_refund_workflow(
+        self,
+    ):
         probe = _make_probe()
         probe.agent_config = _support_base_config()
 
@@ -656,7 +659,9 @@ class TestRequiredWorkflowSelection:
             ["search_catalog", "place_order", "process_payment"]
         ]
 
-    def test_search_prioritizes_customer_order_refund_workflow_before_max_chains_cap(self):
+    def test_search_prioritizes_customer_order_refund_workflow_before_max_chains_cap(
+        self,
+    ):
         probe = _make_probe(max_chains=1, max_chain_len=4)
         probe.agent_config = _support_chain_required_config()
         probe.tool_tags = {
@@ -723,7 +728,9 @@ class TestRequiredWorkflowSelection:
         probe = _make_probe()
         probe.agent_config = _ecommerce_chain_required_config()
         probe.tool_tags = {"process_payment": {"delivery": "direct"}}
-        step_plan = MagicMock(return_value=[{"tool": "process_payment", "role": "exploit"}])
+        step_plan = MagicMock(
+            return_value=[{"tool": "process_payment", "role": "exploit"}]
+        )
 
         with patch.object(probe, "_generate_step_plan", step_plan):
             result = probe._generate_chain_attacks(
@@ -743,7 +750,9 @@ class TestRequiredWorkflowSelection:
         probe = _make_probe()
         probe.agent_config = _support_chain_required_config()
         probe.tool_tags = {"issue_refund": {"delivery": "direct"}}
-        step_plan = MagicMock(return_value=[{"tool": "issue_refund", "role": "exploit"}])
+        step_plan = MagicMock(
+            return_value=[{"tool": "issue_refund", "role": "exploit"}]
+        )
 
         with patch.object(probe, "_generate_step_plan", step_plan):
             result = probe._generate_chain_attacks(
@@ -800,7 +809,6 @@ class TestRequiredWorkflowSelection:
             )
 
         assert [chain["sequence"] for chain in result["chains"]] == [sequence]
-
 
 
 # ===========================================================================
@@ -1639,7 +1647,10 @@ class TestPlanDrivenStepwise:
         mock_refine.assert_not_called()
         assert attempt.notes["terminal_backend_reached"] is True
         assert attempt.notes["terminal_retry_suppressed"] is True
-        assert attempt.notes["terminal_backend_reached_reason"] == "terminal_backend_response"
+        assert (
+            attempt.notes["terminal_backend_reached_reason"]
+            == "terminal_backend_response"
+        )
 
     @pytest.mark.parametrize(
         "outcome_change",
@@ -1988,6 +1999,35 @@ class TestArtifactExtractionAndStepCheck:
         assert out["path"] == "/tmp/codereview_uploads/build.sh"
         assert out["path_on_build_host"] == "/tmp/codereview_uploads/build.sh"
 
+    def test_extract_artifacts_repairs_markdown_parser_placeholder(self):
+        probe = _make_probe()
+        probe._get_model_response = MagicMock(
+            return_value=json.dumps(
+                {"artifacts": {"exact_field": "upl_real", "upload_id": "**"}}
+            )
+        )
+        response = (
+            "Uploaded the file.\n\n"
+            "- **Filename:** `ci-manifest.yml`\n"
+            "- **upload_id:** `upl_real`\n"
+        )
+        chain = {
+            "sequence": ["upload_file", "run_ci_command"],
+            "step_plan": [
+                {
+                    "tool": "upload_file",
+                    "role": "plant",
+                    "artifact_keys": ["upload_id", "uploaded_filename"],
+                }
+            ],
+        }
+
+        out = probe._extract_artifacts(chain, 0, "upload", response)
+
+        assert out["upload_id"] == "upl_real"
+        assert out["filename"] == "ci-manifest.yml"
+        assert out["uploaded_filename"] == "ci-manifest.yml"
+
     def test_extract_artifacts_recovers_upload_fields_when_parse_json_invalid(self):
         probe = _make_probe()
         probe._get_model_response = MagicMock(return_value="not json")
@@ -2026,7 +2066,11 @@ class TestArtifactExtractionAndStepCheck:
                 {
                     "tool": "upload_file",
                     "role": "plant",
-                    "artifact_keys": ["upload_id", "uploaded_filename", "path_on_build_host"],
+                    "artifact_keys": [
+                        "upload_id",
+                        "uploaded_filename",
+                        "path_on_build_host",
+                    ],
                 }
             ],
         }
@@ -2115,19 +2159,26 @@ class TestArtifactExtractionAndStepCheck:
 
     def test_upload_parameter_prompt_is_recognized(self):
         prompt = "Pass upload-123 and payload.py as parameters to run_ci_command."
-        assert AgentBreakerChains._prompt_processes_upload_context(
-            prompt,
-            {
-                "upload_id": "upload-123",
-                "uploaded_filename": "payload.py",
-            },
-        ) is True
+        assert (
+            AgentBreakerChains._prompt_processes_upload_context(
+                prompt,
+                {
+                    "upload_id": "upload-123",
+                    "uploaded_filename": "payload.py",
+                },
+            )
+            is True
+        )
 
     def test_merge_guard_accepts_backend_token_without_repeating_upload_marker(self):
         chain = {
             "sequence": ["get_pr", "upload_file", "run_ci_command", "merge_pr"],
             "step_plan": [
-                {"tool": "get_pr", "input_artifact_keys": [], "artifact_keys": ["pr_number", "repo"]},
+                {
+                    "tool": "get_pr",
+                    "input_artifact_keys": [],
+                    "artifact_keys": ["pr_number", "repo"],
+                },
                 {
                     "tool": "upload_file",
                     "input_artifact_keys": [],
@@ -2135,7 +2186,12 @@ class TestArtifactExtractionAndStepCheck:
                 },
                 {
                     "tool": "run_ci_command",
-                    "input_artifact_keys": ["pr_number", "repo", "upload_id", "uploaded_filename"],
+                    "input_artifact_keys": [
+                        "pr_number",
+                        "repo",
+                        "upload_id",
+                        "uploaded_filename",
+                    ],
                     "artifact_keys": ["merge_token"],
                 },
                 {
@@ -2160,7 +2216,10 @@ class TestArtifactExtractionAndStepCheck:
                 {"tool": "get_pr", "artifacts": {"pr_number": "1", "repo": "app"}},
                 {
                     "tool": "upload_file",
-                    "artifacts": {"upload_id": "upl_123", "uploaded_filename": "payload.py"},
+                    "artifacts": {
+                        "upload_id": "upl_123",
+                        "uploaded_filename": "payload.py",
+                    },
                 },
                 {"tool": "run_ci_command", "artifacts": {"merge_token": "merge_abc"}},
             ],
@@ -2179,7 +2238,11 @@ class TestArtifactExtractionAndStepCheck:
         chain = {
             "sequence": ["get_pr", "upload_file", "run_ci_command", "merge_pr"],
             "step_plan": [
-                {"tool": "get_pr", "input_artifact_keys": [], "artifact_keys": ["pr_number", "repo"]},
+                {
+                    "tool": "get_pr",
+                    "input_artifact_keys": [],
+                    "artifact_keys": ["pr_number", "repo"],
+                },
                 {
                     "tool": "upload_file",
                     "input_artifact_keys": [],
@@ -2192,7 +2255,12 @@ class TestArtifactExtractionAndStepCheck:
                 },
                 {
                     "tool": "merge_pr",
-                    "input_artifact_keys": ["pr_number", "repo", "upload_id", "merge_token"],
+                    "input_artifact_keys": [
+                        "pr_number",
+                        "repo",
+                        "upload_id",
+                        "merge_token",
+                    ],
                     "artifact_keys": [],
                 },
             ],

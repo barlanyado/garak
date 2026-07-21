@@ -35,6 +35,24 @@ Unknown security-relevant capabilities use ``other_security_impact`` at severity
 output is retained in the stage trace and the normalized interface plus derived
 graph policy is retained as a ``TOOL_INTERFACE_NORMALIZATION`` episode event.
 
+After all tools are tagged, code reconciles direct-control claims across the
+complete interface set. A required input with an exact field issued by another
+tool is not treated as directly conversation-controlled, even when an isolated
+tagging response claimed otherwise. Exact producer/consumer field matches are
+accepted deterministically with confidence 1.0. Only semantic matches and
+renamed fields with lexical or evidence support are sent to ``EDGE_SCORE``;
+unrelated all-pairs combinations are discarded before the model call. The
+partition is retained as an ``EDGE_BINDING_PARTITION`` episode event.
+
+Path ranking prefers a complete workflow advertised by the public target
+contract before applying ``max_chains``. Deterministic prerequisite completion
+then restores join-shaped visible context and state ordering supported by that
+contract, including recon that must precede an upload-backed workflow. These
+edges carry ``dependency_kind=state_precondition`` in the retained subgraph.
+Artifact handles recovered from exact named fields in a visible tool response
+override malformed parser placeholders; this includes Markdown-formatted field
+labels.
+
 ``max_parallel_stage_requests`` bounds independent interface-tagging and path-
 analysis calls; stateful target execution remains sequential.
 

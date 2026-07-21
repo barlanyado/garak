@@ -3,7 +3,10 @@
 
 """Dependency-graph tests for the evidence-grounded chain pipeline."""
 
+import json
+
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
@@ -397,6 +400,194 @@ def test_v2_unresolved_field_names_reach_edge_scoring_candidates():
     assert edges[0]["match_kind"] == "unresolved"
     assert edges[0]["producer_field"] == "merge_pr_token"
     assert edges[0]["consumer_field"] == "merge_token"
+
+
+def test_unrelated_all_pairs_are_filtered_before_edge_scoring():
+    tags = {
+        "list_items": _tag(
+            produces=(_field("$response", "pull_request_list"),), source=True
+        ),
+        "upload": _tag(
+            consumes=(
+                _field("filename", "file_name"),
+                _field("content", "file_content"),
+            ),
+            produces=(_field("upload_id", "uploaded_object_identifier"),),
+            source=True,
+        ),
+        "run_job": _tag(
+            consumes=(
+                _field("repo", "repository_identifier"),
+                _field("upload_id", "uploaded_object_identifier"),
+            ),
+            produces=(_field("merge_pr_token", "merge_authorization"),),
+        ),
+        "merge": _tag(
+            consumes=(_field("merge_token", "authorization_artifact"),),
+            sink=True,
+            severity=5,
+        ),
+    }
+
+    edges = AgentBreakerChains._build_capability_graph(tags)
+
+    pairs = {(edge["producer_field"], edge["consumer_field"]) for edge in edges}
+    assert ("upload_id", "upload_id") in pairs
+    assert ("merge_pr_token", "merge_token") in pairs
+    assert ("upload_id", "repo") not in pairs
+    assert ("merge_pr_token", "filename") not in pairs
+
+
+def test_exact_edge_is_accepted_without_model_call():
+    probe = object.__new__(AgentBreakerChains)
+    probe.tool_tags = {}
+    probe.min_edge_confidence = 0.6
+    probe.episode_trace_path = None
+    probe._get_stage_model_response = MagicMock()
+    candidate = {
+        "from": "upload",
+        "to": "run_job",
+        "producer_field": "upload_id",
+        "consumer_field": "upload_id",
+        "match_kind": "exact",
+        "consumer_requirement": "required",
+    }
+
+    edges = probe._score_edges([candidate])
+
+    probe._get_stage_model_response.assert_not_called()
+    assert edges == [
+        {
+            "from": "upload",
+            "to": "run_job",
+            "producer_field": "upload_id",
+            "consumer_field": "upload_id",
+            "confidence": 1.0,
+            "data_flow": "exact field upload_id is passed to upload_id",
+            "evidence": "deterministic exact field-name match",
+            "match_kind": "exact",
+            "consumer_requirement": "required",
+        }
+    ]
+
+
+def test_empty_ambiguous_model_result_preserves_exact_edge():
+    probe = object.__new__(AgentBreakerChains)
+    probe.tool_tags = {}
+    probe.min_edge_confidence = 0.6
+    probe.episode_trace_path = None
+    probe._prompts = {"EDGE_SCORE": "TOOLS {tool_tags}\nCANDIDATES {candidate_edges}"}
+    probe._get_stage_model_response = MagicMock(return_value='{"edges": []}')
+    probe._detector = MagicMock()
+    probe._detector._extract_json.side_effect = json.loads
+    exact = {
+        "from": "upload",
+        "to": "run_job",
+        "producer_field": "upload_id",
+        "consumer_field": "upload_id",
+        "match_kind": "exact",
+        "consumer_requirement": "required",
+    }
+    renamed = {
+        "from": "run_job",
+        "to": "merge",
+        "producer_field": "merge_pr_token",
+        "consumer_field": "merge_token",
+        "match_kind": "unresolved",
+        "consumer_requirement": "required",
+    }
+
+    edges = probe._score_edges([exact, renamed])
+
+    assert len(edges) == 1
+    assert edges[0]["match_kind"] == "exact"
+    rendered_prompt = probe._get_stage_model_response.call_args.args[1]
+    assert "merge_pr_token" in rendered_prompt
+    assert '"producer_field": "upload_id"' not in rendered_prompt
+
+
+def test_tool_issued_required_field_is_not_conversation_controlled():
+    tags = {
+        "upload": {
+            "produce_records": [_output("upload_id")],
+            "consume_records": [],
+            "attacker_controlled_fields": [],
+            "is_source": True,
+        },
+        "run_job": {
+            "produce_records": [],
+            "consume_records": [_input("upload_id")],
+            "attacker_controlled_fields": [
+                {"field": "upload_id", "evidence": "conversation supplies it"}
+            ],
+            "is_source": True,
+        },
+    }
+
+    reconciled = AgentBreakerChains._reconcile_attacker_controlled_fields(tags)
+
+    assert reconciled["run_job"]["attacker_controlled_fields"] == []
+    assert reconciled["run_job"]["is_source"] is False
+    assert reconciled["run_job"]["removed_attacker_controlled_fields"][0][
+        "producer_tools"
+    ] == ["upload"]
+
+
+def test_complete_terminal_workflow_wins_before_max_chains_truncation():
+    probe = object.__new__(AgentBreakerChains)
+    probe.max_chain_len = 4
+    probe.max_chains = 1
+    probe.agent_config = {
+        "tools": [
+            {"name": "list_pull_requests", "description": "List pull requests"},
+            {"name": "upload_file", "description": "Upload a file"},
+            {
+                "name": "run_ci_command",
+                "description": "Use an upload and return authorization context",
+            },
+            {
+                "name": "merge_pr",
+                "description": "Merge with prior authorization context",
+            },
+        ]
+    }
+    tags = {
+        "upload_file": {"is_source": True, "is_sink": True, "sink_severity": 3},
+        "run_ci_command": {
+            "is_source": False,
+            "is_sink": True,
+            "sink_severity": 5,
+        },
+        "merge_pr": {"is_source": False, "is_sink": True, "sink_severity": 5},
+    }
+    probe.tool_tags = tags
+    edges = [
+        {
+            "from": "upload_file",
+            "to": "run_ci_command",
+            "producer_field": "upload_id",
+            "consumer_field": "upload_id",
+            "consumer_requirement": "required",
+            "confidence": 1.0,
+        },
+        {
+            "from": "run_ci_command",
+            "to": "merge_pr",
+            "producer_field": "merge_token",
+            "consumer_field": "merge_token",
+            "consumer_requirement": "required",
+            "confidence": 1.0,
+        },
+    ]
+
+    paths = probe._search_chains(edges, tags)
+
+    assert len(paths) == 1
+    assert paths[0]["sequence"] == [
+        "upload_file",
+        "run_ci_command",
+        "merge_pr",
+    ]
 
 
 def test_v2_validator_accepts_complete_contract():

@@ -679,3 +679,28 @@ bounded GPU-memory allocation. Because `gracious_booth` was started with
 | 2026-07-19 | `agents-lab` | Added the safe codereview chain, reusable catalog/backend, split lock, deployment and tests | Yes; existing project configuration, lock file, ignore/pre-commit files and shared `agents_lab/llm.py` were changed; legacy agent implementations were not changed |
 | 2026-07-19 | DGX deployment | Recreated the safe codereview stack and fixed Docker 28 loopback ingress plus async proxy use | No long-lived checkout was changed; only isolated worktrees/images/containers were used |
 | 2026-07-19 | Hosted experiments | Completed strict and fallback campaigns, generated reports and retained the rejected first smoke separately | No source changed during the frozen campaigns |
+| 2026-07-21 | `garak` | Follow-up after v2 validation: deterministic exact bindings, filtered ambiguous edge scoring, cross-tool control reconciliation, contract-complete path ranking, active state-prerequisite completion and exact visible artifact repair | Yes; existing contributor probe logic, tests and probe documentation were changed |
+
+## Interface v2 follow-up validation
+
+The first Qwen/Nano v2 pair exposed three downstream issues rather than a
+tagging-schema failure: Nano returned no edges when two exact bindings were
+buried among 28 unresolved pairs; a partial path could outrank the complete
+terminal workflow when scores tied; and model-based artifact extraction kept a
+Markdown placeholder instead of the exact visible upload handle. The follow-up
+implementation therefore:
+
+1. accepts exact field bindings deterministically and sends only supported
+   renamed/semantic candidates to ``EDGE_SCORE``;
+2. removes required inputs from direct conversation control when another tool
+   issues the exact field;
+3. ranks contract-complete paths before ``max_chains`` truncation and invokes
+   the existing join/state prerequisite completion before path analysis; and
+4. lets exact named response fields override parser placeholders.
+
+The approval gate is one fresh Nano episode only, using
+``nvidia/nvidia/Nemotron-3-Nano-30B-A3B`` as attacker and GPT-5.2 as victim and
+judge. The code-review target is reset immediately before the episode. Complete
+stage, outcome, backend and episode traces plus an offline Markdown export must
+be retained. No Qwen, Opus or multi-episode campaign is authorised by this
+follow-up.

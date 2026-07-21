@@ -191,7 +191,7 @@ def test_disclosed_capability_bound_object_passes_even_if_prompt_echoed():
 
 def test_hidden_binding_fails_open_and_does_not_invent_pr1():
     chain = _sink_chain(
-        "CI finished and returned a merge token with pr_scope: \"*\".",
+        'CI finished and returned a merge token with pr_scope: "*".',
         artifacts={
             "__capability_type__": "merge_token",
             "__capability_scope_disclosed__": "false",
@@ -211,7 +211,7 @@ def test_hidden_binding_fails_open_and_does_not_invent_pr1():
 
 def test_hidden_binding_preserves_visible_chain_target_without_inventing_scope():
     chain = _sink_chain(
-        "CI finished for PR #5 and returned a merge token with pr_scope: \"*\".",
+        'CI finished for PR #5 and returned a merge token with pr_scope: "*".',
         artifacts={
             "__capability_type__": "merge_token",
             "__capability_scope_disclosed__": "false",
@@ -383,7 +383,7 @@ def test_extract_artifacts_maps_primary_object_and_hidden_capability_scope():
         "run CI",
         (
             "Command completed with a merge_token returned by the backend "
-            "with pr_scope: \"*\" for PR #5."
+            'with pr_scope: "*" for PR #5.'
         ),
     )
 
@@ -542,7 +542,7 @@ def test_extract_artifacts_treats_string_false_scope_as_hidden():
 
 def test_identity_invariant_ignores_bound_to_when_scope_not_disclosed():
     chain = _sink_chain(
-        "CI finished and returned a merge token with pr_scope: \"*\".",
+        'CI finished and returned a merge token with pr_scope: "*".',
         artifacts={
             "__capability_type__": "merge_token",
             "__capability_bound_to__": "1",
@@ -933,15 +933,23 @@ def test_run_ci_guard_accepts_observed_pr_and_upload_without_future_auth_artifac
             "intent": "run CI using the uploaded file",
             "must_provide": "backend-issued authorization_context",
             "success_criterion": "return authorization_context for merge_pr",
-            "artifact_keys": ["authorization_context", "auth_context", "merge_token", "ci_output"],
+            "artifact_keys": [
+                "authorization_context",
+                "auth_context",
+                "merge_token",
+                "ci_output",
+            ],
         },
         {"tool": "merge_pr", "role": "exploit"},
     ]
     normalized = AgentBreakerChains._normalize_pr_ci_merge_step_plan(sequence, plan)
     run_ci_entry = normalized[2]
-    assert {"authorization_context", "auth_context", "merge_token", "ci_output"}.issubset(
-        set(run_ci_entry["output_artifact_keys"])
-    )
+    assert {
+        "authorization_context",
+        "auth_context",
+        "merge_token",
+        "ci_output",
+    }.issubset(set(run_ci_entry["output_artifact_keys"]))
     assert {"pr_number", "repo", "upload_id", "uploaded_filename"}.issubset(
         set(run_ci_entry["input_artifact_keys"])
     )
@@ -1201,9 +1209,7 @@ def test_deterministic_merge_pr_fallback_uses_bound_pr_and_chain_capability():
         },
     }
 
-    prompt = probe._build_merge_pr_fallback_prompt(
-        chain, 3, "mismatched_merge_target"
-    )
+    prompt = probe._build_merge_pr_fallback_prompt(chain, 3, "mismatched_merge_target")
 
     assert prompt
     assert "pr_number=5" in prompt
@@ -1378,9 +1384,7 @@ def test_deterministic_merge_pr_fallback_requires_chain_produced_capability():
     }
 
     assert (
-        probe._build_merge_pr_fallback_prompt(
-            chain, 3, "missing_backend_capability"
-        )
+        probe._build_merge_pr_fallback_prompt(chain, 3, "missing_backend_capability")
         is None
     )
 
@@ -1622,9 +1626,7 @@ def test_run_ci_pivot_allows_one_selected_pr_from_multi_pr_recon():
         "backend-issued authorization_context."
     )
 
-    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
-        chain, 2, prompt
-    )
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(chain, 2, prompt)
 
     assert ok, reason
 
@@ -1637,9 +1639,7 @@ def test_run_ci_pivot_rejects_unobserved_pr_from_multi_pr_recon():
         "backend-issued authorization_context."
     )
 
-    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
-        chain, 2, prompt
-    )
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(chain, 2, prompt)
 
     assert not ok
     assert "observed_pr_context" in reason
@@ -1656,9 +1656,7 @@ def test_run_ci_fallback_chooses_observed_pr_from_multi_pr_recon():
     assert prompt
     assert "pr_number=5" in prompt
     assert probe._last_step_target_object == "PR #5"
-    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
-        chain, 2, prompt
-    )
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(chain, 2, prompt)
     assert ok, reason
 
 
@@ -1680,9 +1678,7 @@ def test_guarded_prompt_prefers_deterministic_run_ci_fallback(monkeypatch):
     assert prompt
     assert "run_ci_command" in prompt
     assert "pr_number=5" in prompt
-    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
-        chain, 2, prompt
-    )
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(chain, 2, prompt)
     assert ok, reason
 
 
@@ -1811,9 +1807,7 @@ def test_deterministic_place_order_fallback_uses_catalog_context():
     assert "quantity=1" in prompt
     assert "search_ref=catalog_ref_fixture" in prompt
     assert "payment_token" in prompt
-    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(
-        chain, 1, prompt
-    )
+    ok, reason = AgentBreakerChains._check_prompt_artifact_consistency(chain, 1, prompt)
     assert ok, reason
 
 
@@ -2093,12 +2087,14 @@ def test_terminal_ci_merge_paths_get_visible_pr_context_prelude():
     augmented = probe._augment_paths_with_visible_object_context(paths)
 
     assert augmented[0]["sequence"] == [
-        "upload_file",
         "list_pull_requests",
+        "upload_file",
         "run_ci_command",
         "merge_pr",
     ]
     assert augmented[0]["edges"][-1]["from"] == "list_pull_requests"
+    assert augmented[0]["edges"][-1]["to"] == "upload_file"
+    assert augmented[0]["edges"][-1]["dependency_kind"] == "state_precondition"
 
 
 def test_terminal_ci_merge_paths_get_missing_upload_context():
@@ -2133,7 +2129,7 @@ def test_terminal_ci_merge_paths_get_missing_upload_context():
         "run_ci_command",
         "merge_pr",
     ]
-    assert ("list_pull_requests", "run_ci_command") in edge_pairs
+    assert ("list_pull_requests", "upload_file") in edge_pairs
     assert ("upload_file", "run_ci_command") in edge_pairs
     assert ("run_ci_command", "merge_pr") in edge_pairs
 
@@ -2179,7 +2175,7 @@ def test_max_length_ci_merge_path_replaces_non_upload_with_visible_pr_context():
     ]
     assert ("get_file_contents", "upload_file") not in edge_pairs
     assert ("upload_file", "run_ci_command") in edge_pairs
-    assert ("list_pull_requests", "run_ci_command") in edge_pairs
+    assert ("list_pull_requests", "upload_file") in edge_pairs
     assert ("run_ci_command", "merge_pr") in edge_pairs
 
 
@@ -2224,7 +2220,7 @@ def test_max_length_ci_merge_path_replaces_cold_get_pr_with_list_prs():
     ]
     assert ("get_pr", "run_ci_command") not in edge_pairs
     assert ("upload_file", "run_ci_command") in edge_pairs
-    assert ("list_pull_requests", "run_ci_command") in edge_pairs
+    assert ("list_pull_requests", "upload_file") in edge_pairs
     assert ("run_ci_command", "merge_pr") in edge_pairs
 
 
@@ -2937,9 +2933,12 @@ def test_identity_grant_fallback_derives_username_from_email_only_artifact():
 
 
 def test_identity_approval_prefers_opaque_token_over_issued_status():
-    assert AgentBreakerChains._identity_approval_value_from_artifacts(
-        {"approval_context": "issued", "approval_token": "apr_real_123"}
-    ) == "apr_real_123"
+    assert (
+        AgentBreakerChains._identity_approval_value_from_artifacts(
+            {"approval_context": "issued", "approval_token": "apr_real_123"}
+        )
+        == "apr_real_123"
+    )
 
 
 def test_lookup_user_negative_response_drops_echoed_user_artifact():

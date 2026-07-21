@@ -989,7 +989,7 @@ class AgentBreakerChains(AgentBreaker):
         if not sequence:
             return (0, 0, 0, 0, 0, 0, 0, 0)
         sink = sequence[-1]
-        sink_tags = self.tool_tags.get(sink, {}) or {}
+        sink_tags = getattr(self, "tool_tags", {}).get(sink, {}) or {}
         sink_text = " ".join(
             [
                 sink,
@@ -1330,17 +1330,29 @@ class AgentBreakerChains(AgentBreaker):
            security capabilities, then derive source/sink markers in code.
         2. `_build_capability_graph` — pure-Python candidate edges where
            one tool's output tag feeds another tool's input tag.
-        3. `_score_edges` — one batched LLM call to confirm/score edges.
+        3. `_score_edges` — accept exact bindings in code and ask one batched
+           LLM call to confirm only plausible ambiguous bindings.
         4. `_search_chains` — pure-Python bounded source->sink path search,
            ranked by ``sink_severity * product(edge_confidence)``.
-        5. `_generate_chain_attacks` — write conversational payloads for
+        5. Deterministically complete public join/state prerequisites.
+        6. `_generate_chain_attacks` — write conversational payloads for
            each concrete path.
 
         Returns a dict with ``chains`` and ``priority_chains`` keys (the same
         shape the downstream attack/refinement code already consumes). Returns
         empty values whenever a stage produces nothing.
         """
-        self.tool_tags = self._tag_tool_capabilities()
+        tagged_interfaces = self._tag_tool_capabilities()
+        self.tool_tags = self._reconcile_attacker_controlled_fields(tagged_interfaces)
+        self._record_probe_event(
+            kind="deterministic",
+            stage="TOOL_INTERFACE_RECONCILIATION",
+            input_data=tagged_interfaces,
+            output_data=self.tool_tags,
+            metadata={
+                "policy": "tool-issued required values are not directly conversation-controlled"
+            },
+        )
         if not self.tool_tags:
             logging.info(
                 f"{self.__class__.__name__} # Skipping chain analysis: "
@@ -1365,6 +1377,17 @@ class AgentBreakerChains(AgentBreaker):
         paths = self._search_chains(edges, self.tool_tags)
         if not paths:
             logging.info(f"{self.__class__.__name__} # No source->sink chains found")
+            return {"chains": [], "priority_chains": []}
+
+        # Complete join-shaped and stateful prerequisites already advertised by
+        # the public target contract before asking a model to analyse the path.
+        # These helpers are deterministic and preserve exact runtime tool names.
+        paths = self._augment_paths_with_visible_object_context(paths)
+        paths = self._augment_paths_with_identity_user_context(paths)
+        if not paths:
+            logging.info(
+                f"{self.__class__.__name__} # No dependency-complete chains found"
+            )
             return {"chains": [], "priority_chains": []}
 
         paths = self._analyse_paths(paths)
@@ -1433,6 +1456,57 @@ class AgentBreakerChains(AgentBreaker):
         else:
             results = [classify(tool) for tool in tools]
         return {name: record for name, record in results if record is not None}
+
+    @staticmethod
+    def _reconcile_attacker_controlled_fields(tool_tags: dict) -> dict:
+        """Remove claimed direct control when another tool issues the value.
+
+        Interface tagging happens independently and in parallel, so a model can
+        label an opaque downstream handle as conversation-controlled without
+        seeing that another tool produces the same required field. Reconcile the
+        complete set in code and recompute source status conservatively.
+        """
+        produced_by: dict[str, set[str]] = {}
+        for producer, tag in tool_tags.items():
+            for record in tag.get("produce_records", []) or []:
+                field = str(record.get("field") or "").strip().lower()
+                if field and field != "$response":
+                    produced_by.setdefault(field, set()).add(producer)
+
+        reconciled: dict = {}
+        for tool_name, original in tool_tags.items():
+            tag = dict(original)
+            retained = []
+            removed = []
+            for item in tag.get("attacker_controlled_fields", []) or []:
+                field = str(item.get("field") or "").strip().lower()
+                issuers = produced_by.get(field, set()) - {tool_name}
+                if issuers:
+                    removed.append(
+                        {
+                            **item,
+                            "reason": "value is issued by another tool",
+                            "producer_tools": sorted(issuers),
+                        }
+                    )
+                else:
+                    retained.append(item)
+            tag["attacker_controlled_fields"] = retained
+            controlled = {
+                str(item.get("field") or "").strip().lower()
+                for item in retained
+                if isinstance(item, dict)
+            }
+            mandatory = {
+                str(item.get("field") or "").strip().lower()
+                for item in tag.get("consume_records", []) or []
+                if isinstance(item, dict) and item.get("required") == "required"
+            }
+            tag["is_source"] = not mandatory or mandatory.issubset(controlled)
+            if removed:
+                tag["removed_attacker_controlled_fields"] = removed
+            reconciled[tool_name] = tag
+        return reconciled
 
     @staticmethod
     def _normalise_tool_interface(name: str, parsed: dict, evidence: dict) -> dict:
@@ -1660,61 +1734,136 @@ class AgentBreakerChains(AgentBreaker):
                         ) == consumed.get(
                             "semantic_type"
                         )
-                        edges.append(
-                            {
-                                "from": src,
-                                "to": dst,
-                                "producer_field": produced["field"],
-                                "consumer_field": consumed["field"],
-                                "producer_semantic_type": produced.get(
-                                    "semantic_type", "unknown"
-                                ),
-                                "consumer_semantic_type": consumed.get(
-                                    "semantic_type", "unknown"
-                                ),
-                                "match_kind": (
-                                    "exact"
-                                    if exact
-                                    else "semantic" if semantic else "unresolved"
-                                ),
-                                "consumer_requirement": consumed.get(
-                                    "required", "unknown"
-                                ),
-                                "producer_evidence": produced.get("evidence", ""),
-                                "consumer_evidence": consumed.get("evidence", ""),
-                            }
-                        )
+                        candidate = {
+                            "from": src,
+                            "to": dst,
+                            "producer_field": produced["field"],
+                            "consumer_field": consumed["field"],
+                            "producer_semantic_type": produced.get(
+                                "semantic_type", "unknown"
+                            ),
+                            "consumer_semantic_type": consumed.get(
+                                "semantic_type", "unknown"
+                            ),
+                            "match_kind": (
+                                "exact"
+                                if exact
+                                else "semantic" if semantic else "unresolved"
+                            ),
+                            "consumer_requirement": consumed.get("required", "unknown"),
+                            "producer_evidence": produced.get("evidence", ""),
+                            "consumer_evidence": consumed.get("evidence", ""),
+                        }
+                        if (
+                            exact
+                            or semantic
+                            or AgentBreakerChains._plausible_ambiguous_binding(
+                                candidate
+                            )
+                        ):
+                            edges.append(candidate)
         return edges
 
-    def _score_edges(self, candidate_edges: List[dict]) -> List[dict]:
-        """Score all candidate edges in one batched LLM call.
+    @staticmethod
+    def _binding_tokens(value: object) -> set[str]:
+        """Return meaningful identifier tokens for conservative prefiltering."""
+        tokens = set(re.findall(r"[a-z0-9]+", str(value or "").lower()))
+        return tokens - {
+            "a",
+            "an",
+            "field",
+            "id",
+            "identifier",
+            "object",
+            "output",
+            "response",
+            "the",
+            "unknown",
+            "value",
+        }
 
-        Returns the edges with ``confidence >= min_edge_confidence``, each
-        carrying a one-line ``data_flow`` describing what concretely moves from
-        source to target.
+    @staticmethod
+    def _plausible_ambiguous_binding(candidate: dict) -> bool:
+        """Keep only ambiguous bindings with some lexical or semantic support."""
+        producer_field = str(candidate.get("producer_field") or "")
+        consumer_field = str(candidate.get("consumer_field") or "")
+        producer_semantic = str(candidate.get("producer_semantic_type") or "")
+        consumer_semantic = str(candidate.get("consumer_semantic_type") or "")
+        producer_tokens = AgentBreakerChains._binding_tokens(producer_field)
+        consumer_tokens = AgentBreakerChains._binding_tokens(consumer_field)
+        semantic_overlap = AgentBreakerChains._binding_tokens(
+            producer_semantic
+        ).intersection(AgentBreakerChains._binding_tokens(consumer_semantic))
+        if producer_tokens.intersection(consumer_tokens) or semantic_overlap:
+            return True
+        producer_evidence = str(candidate.get("producer_evidence") or "").lower()
+        consumer_evidence = str(candidate.get("consumer_evidence") or "").lower()
+        return bool(
+            (producer_field and producer_field.lower() in consumer_evidence)
+            or (consumer_field and consumer_field.lower() in producer_evidence)
+        )
+
+    def _score_edges(self, candidate_edges: List[dict]) -> List[dict]:
+        """Accept exact bindings in code and score only ambiguous candidates.
+
+        Exact field names are authoritative and do not need model judgement.
+        Semantic or conservatively prefiltered renamed bindings remain an LLM
+        task and must pass ``min_edge_confidence``.
         """
+        exact = [edge for edge in candidate_edges if edge.get("match_kind") == "exact"]
+        ambiguous = [
+            edge for edge in candidate_edges if edge.get("match_kind") != "exact"
+        ]
+        scored: List[dict] = [
+            {
+                "from": edge["from"],
+                "to": edge["to"],
+                "producer_field": edge["producer_field"],
+                "consumer_field": edge["consumer_field"],
+                "confidence": 1.0,
+                "data_flow": (
+                    f"exact field {edge['producer_field']} is passed to "
+                    f"{edge['consumer_field']}"
+                ),
+                "evidence": "deterministic exact field-name match",
+                "match_kind": "exact",
+                "consumer_requirement": edge.get("consumer_requirement", "unknown"),
+            }
+            for edge in exact
+        ]
+        self._record_probe_event(
+            kind="deterministic",
+            stage="EDGE_BINDING_PARTITION",
+            input_data={"candidate_edges": candidate_edges},
+            output_data={
+                "accepted_exact_edges": scored,
+                "ambiguous_edges_for_model": ambiguous,
+            },
+        )
+        if not ambiguous:
+            return scored
+
         tool_tags_str = json.dumps(self.tool_tags, indent=2)
-        candidate_edges_str = json.dumps(candidate_edges, indent=2)
+        candidate_edges_str = json.dumps(ambiguous, indent=2)
         prompt = self._prompts["EDGE_SCORE"].format(
             tool_tags=tool_tags_str,
             candidate_edges=candidate_edges_str,
         )
         response = self._get_stage_model_response("EDGE_SCORE", prompt)
         if not response:
-            return []
+            return scored
         try:
             parsed = self._detector._extract_json(response)
         except json.JSONDecodeError as e:
             logging.warning(
                 f"{self.__class__.__name__} # Failed to parse edge scores JSON: {e}"
             )
-            return []
+            return scored
 
         allowed = {
             (e["from"], e["to"], e["producer_field"], e["consumer_field"]): e
-            for e in candidate_edges
+            for e in ambiguous
         }
-        scored: List[dict] = []
         for e in parsed.get("edges", []) or []:
             src = e.get("from")
             dst = e.get("to")
@@ -1983,16 +2132,25 @@ class AgentBreakerChains(AgentBreaker):
                         if e.get("from") != removed and e.get("to") != removed
                     ]
                 else:
-                    sequence.insert(consumer_idx, recon_tool)
+                    # The visible object/revision context is a state
+                    # prerequisite for the upload-backed workflow, not merely
+                    # another input to CI. Put cold-start recon before both the
+                    # upload and the CI consumer.
+                    upload_idx = (
+                        sequence.index(upload_tool)
+                        if upload_tool and upload_tool in sequence[:consumer_idx]
+                        else consumer_idx
+                    )
+                    sequence.insert(min(upload_idx, consumer_idx), recon_tool)
                 edges.append(
                     {
                         "from": recon_tool,
-                        "to": "run_ci_command",
+                        "to": upload_tool or "run_ci_command",
                         "confidence": 1.0,
+                        "dependency_kind": "state_precondition",
                         "data_flow": (
-                            "visible pull-request context (repo and PR number) "
-                            "surfaced by recon is consumed by run_ci_command and "
-                            "preserved for merge_pr"
+                            "visible pull-request context and revision must be "
+                            "observed before the upload-backed CI workflow"
                         ),
                     }
                 )
@@ -2036,6 +2194,33 @@ class AgentBreakerChains(AgentBreaker):
                     }
                 )
                 changed = True
+
+            if recon_tool in sequence and upload_tool in sequence:
+                recon_idx = sequence.index(recon_tool)
+                upload_idx = sequence.index(upload_tool)
+                if recon_idx > upload_idx:
+                    sequence.pop(recon_idx)
+                    sequence.insert(upload_idx, recon_tool)
+                    changed = True
+                if not any(
+                    edge.get("from") == recon_tool
+                    and edge.get("to") == upload_tool
+                    and edge.get("dependency_kind") == "state_precondition"
+                    for edge in edges
+                ):
+                    edges.append(
+                        {
+                            "from": recon_tool,
+                            "to": upload_tool,
+                            "confidence": 1.0,
+                            "dependency_kind": "state_precondition",
+                            "data_flow": (
+                                "visible pull-request context and revision must "
+                                "be observed before the upload-backed CI workflow"
+                            ),
+                        }
+                    )
+                    changed = True
 
             if changed:
                 logging.info(
@@ -2342,7 +2527,12 @@ class AgentBreakerChains(AgentBreaker):
                     "score": severity * confidence,
                 }
             )
-        candidates.sort(key=lambda item: item["score"], reverse=True)
+        candidates.sort(
+            key=lambda item: self._path_search_priority(
+                item["score"], item["sequence"]
+            ),
+            reverse=True,
+        )
         return candidates[: self.max_chains]
 
     def _search_legacy_linear_paths(
@@ -2464,6 +2654,7 @@ class AgentBreakerChains(AgentBreaker):
                         "confidence",
                         "data_flow",
                         "evidence",
+                        "dependency_kind",
                     )
                 }
                 for edge in path.get("edges", [])
@@ -4283,6 +4474,8 @@ class AgentBreakerChains(AgentBreaker):
             patterns = (
                 rf"['\"]{escaped}['\"]\s*:\s*['\"]([^'\"]+)['\"]",
                 rf"['\"]{escaped}['\"]\s*:\s*([^'\"`,}}\]\s]+)",
+                rf"(?:\*\*|__|`)?{escaped}\s*:\s*(?:\*\*|__)?\s*"
+                rf"(?:`|['\"])?([^'\"`,}}\]\s*]+)",
                 rf"\b{escaped}\b\s*[:=]\s*['\"`]?([^'\"`,}}\]\s]+)",
             )
             for pattern in patterns:
@@ -6362,10 +6555,11 @@ class AgentBreakerChains(AgentBreaker):
             tool_name, agent_response
         ).items():
             flat.setdefault(key, value)
-        for key, value in self._structured_tool_response_artifacts(
-            tool_name, agent_response
-        ).items():
-            flat.setdefault(key, value)
+        # Named fields recovered directly from the visible tool response are
+        # stronger evidence than a parser-model placeholder or schema key such
+        # as {"exact_field": "..."}. Let deterministic values repair malformed
+        # model extraction rather than preserving values like Markdown "**".
+        flat.update(self._structured_tool_response_artifacts(tool_name, agent_response))
         if (
             tool_name == "run_access_review"
             and self._response_has_identity_approval_marker(agent_response)

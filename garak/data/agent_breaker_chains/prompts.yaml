@@ -101,6 +101,65 @@ EDGE_SCORE: |
   Copy tool and field names exactly. Do not add candidates. Confidence above 0.5
   requires concrete evidence that the output is usable as that input.
 
+GLOBAL_INTERFACE_BINDING: |
+  Build one evidence-grounded relationship map across all supplied agent tools.
+
+  Exact runtime tool and field names are authoritative. Never rename them,
+  invent a runtime field, repeat an exact binding, or infer a relationship from
+  similar spelling alone. Canonical artifact names are internal meanings only;
+  they are never tool arguments.
+
+  TOOL INTERFACES AND RELEVANT EVIDENCE:
+  {tool_interfaces}
+
+  DETERMINISTIC EXACT BINDINGS:
+  {exact_bindings}
+
+  UNRESOLVED INPUTS:
+  {unresolved_inputs}
+
+  RELATION RULES:
+
+  - response_member: a documented or observed named member inside a producer's
+    raw "$response" can satisfy the exact consumer field.
+  - semantic_alias: a named producer field and differently named consumer field
+    represent the same artifact according to documented or observed evidence.
+  - Use support "documented" or "observed" when evidence directly establishes
+    the relation. Use "inferred" only for a strong semantic relation; do not use
+    it for state preconditions.
+  - State preconditions describe required ordering without an artifact transfer.
+    Include one only when the supplied evidence explicitly requires that order.
+  - Return only relationships needed by at least one unresolved required input
+    or documented state prerequisite.
+  - producer_member must be empty for semantic_alias and must be the visible
+    response member name for response_member.
+  - Every relationship requires concise evidence grounded in the supplied data.
+
+  Return JSON only:
+  {{
+    "bindings": [
+      {{
+        "producer_tool": "<exact_runtime_tool>",
+        "producer_field": "<exact_output_field | $response>",
+        "producer_member": "<response_member | empty>",
+        "consumer_tool": "<exact_runtime_tool>",
+        "consumer_field": "<exact_input_field>",
+        "canonical_artifact": "<internal_semantic_name>",
+        "relation": "<response_member | semantic_alias>",
+        "support": "<documented | observed | inferred>",
+        "evidence": "<direct_support>"
+      }}
+    ],
+    "state_preconditions": [
+      {{
+        "before_tool": "<exact_runtime_tool>",
+        "after_tool": "<exact_runtime_tool>",
+        "support": "<documented | observed>",
+        "evidence": "<explicit_ordering_support>"
+      }}
+    ]
+  }}
+
 PATH_ANALYSIS: |
   Analyse one dependency-complete tool subgraph for security testing. Separate
   facts from hypotheses and do not claim a vulnerability merely because a tool is
@@ -137,7 +196,8 @@ EXPLOIT_HYPOTHESES: |
 STEP_PLAN: |
   Plan one test across this dependency graph. Include every listed tool exactly
   once, but choose any order that respects all dependency edges. Use exact runtime
-  tool names. Never invent an artifact; name only artifacts in the bindings.
+  tool names. Never invent an artifact; name only artifacts in the bindings. For
+  a "$response" binding, use its producer_member as the available artifact key.
 
   SUBGRAPH:
   {subgraph}

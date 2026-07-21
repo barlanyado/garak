@@ -14,6 +14,7 @@ from garak.attempt import Conversation, Message, Turn
 from garak.probes.agent_breaker import AttackState
 from garak.probes.agent_breaker_chains import AgentBreakerChains
 from garak.resources.agent_breaker_stage import (
+    REGISTERED_STAGES,
     STAGES,
     outcome_sidecar_path,
     resolve_git_commit,
@@ -87,13 +88,14 @@ def _stage_probe(tmp_path, response, *, strict=True, stage="STEP_ATTACK"):
 def test_exact_stage_registry():
     assert STAGES == (
         "TOOL_INTERFACE_TAGGING",
-        "EDGE_SCORE",
+        "GLOBAL_INTERFACE_BINDING",
         "PATH_ANALYSIS",
         "EXPLOIT_HYPOTHESES",
         "STEP_PLAN",
         "STEP_ATTACK",
         "STEP_EXPLOIT",
     )
+    assert REGISTERED_STAGES == STAGES + ("EDGE_SCORE",)
     probe = object.__new__(AgentBreakerChains)
     with pytest.raises(ValueError, match="Unregistered"):
         probe._model_for_stage("step_attack")
@@ -179,7 +181,11 @@ def test_hosted_baseline_config_pins_models_routes_and_target_contract():
         },
     }
     assert probe["stage_model_routes"] == {stage: "hosted_baseline" for stage in STAGES}
-    for stage in ("TOOL_INTERFACE_TAGGING", "EDGE_SCORE", "STEP_ATTACK"):
+    for stage in (
+        "TOOL_INTERFACE_TAGGING",
+        "GLOBAL_INTERFACE_BINDING",
+        "STEP_ATTACK",
+    ):
         assert probe["stage_generation_settings"][stage]["extra_params"] == {
             "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}
         }
@@ -194,6 +200,59 @@ def test_hosted_baseline_config_pins_models_routes_and_target_contract():
     assert probe["deterministic_fallbacks_enabled"] is False
     assert probe["behavioral_probe_enabled"] is False
     assert probe["fault_probe_enabled"] is False
+
+
+def test_global_interface_binding_contract_accepts_complete_output():
+    output = {
+        "bindings": [
+            {
+                "producer_tool": "read_items",
+                "producer_field": "$response",
+                "producer_member": "item_id",
+                "consumer_tool": "apply_item",
+                "consumer_field": "item_id",
+                "canonical_artifact": "item_identifier",
+                "relation": "response_member",
+                "support": "observed",
+                "evidence": "observed response includes item_id",
+            }
+        ],
+        "state_preconditions": [
+            {
+                "before_tool": "read_items",
+                "after_tool": "apply_item",
+                "support": "documented",
+                "evidence": "apply_item requires an item returned by read_items",
+            }
+        ],
+    }
+
+    assert validate_stage_output("GLOBAL_INTERFACE_BINDING", output) == []
+
+
+def test_global_interface_binding_contract_rejects_invalid_relation():
+    output = {
+        "bindings": [
+            {
+                "producer_tool": "read_items",
+                "producer_field": "$response",
+                "producer_member": "",
+                "consumer_tool": "apply_item",
+                "consumer_field": "item_id",
+                "canonical_artifact": "item_identifier",
+                "relation": "guess",
+                "support": "weak",
+                "evidence": "",
+            }
+        ],
+        "state_preconditions": [],
+    }
+
+    errors = validate_stage_output("GLOBAL_INTERFACE_BINDING", output)
+
+    assert "$.bindings[0].relation has an invalid value" in errors
+    assert "$.bindings[0].support has an invalid value" in errors
+    assert "$.bindings[0].evidence must be a non-empty string" in errors
 
 
 def test_role_loader_preserves_exact_model_identifier():

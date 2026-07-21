@@ -11,7 +11,7 @@ Exact attacker stages
 
 The chain probe can route and trace exactly these attacker stages:
 
-``TOOL_INTERFACE_TAGGING``, ``EDGE_SCORE``, ``PATH_ANALYSIS``,
+``TOOL_INTERFACE_TAGGING``, ``GLOBAL_INTERFACE_BINDING``, ``PATH_ANALYSIS``,
 ``EXPLOIT_HYPOTHESES``, ``STEP_PLAN``, ``STEP_ATTACK``, and
 ``STEP_EXPLOIT``.
 
@@ -39,10 +39,18 @@ After all tools are tagged, code reconciles direct-control claims across the
 complete interface set. A required input with an exact field issued by another
 tool is not treated as directly conversation-controlled, even when an isolated
 tagging response claimed otherwise. Exact producer/consumer field matches are
-accepted deterministically with confidence 1.0. Only semantic matches and
-renamed fields with lexical or evidence support are sent to ``EDGE_SCORE``;
-unrelated all-pairs combinations are discarded before the model call. The
-partition is retained as an ``EDGE_BINDING_PARTITION`` episode event.
+accepted deterministically with confidence 1.0. One
+``GLOBAL_INTERFACE_BINDING`` call then sees all compact interfaces, exact
+bindings, unresolved inputs, declared contracts and bounded recon evidence. It
+may add a named member of ``$response``, a differently named field with the same
+documented meaning, or an explicitly supported state precondition. Code rejects
+invented tool and field names, invalid relation types and unsupported state
+ordering before path search. Canonical artifact names are internal labels only;
+runtime tool and field names remain authoritative. Accepted and rejected
+relations are retained in a ``GLOBAL_INTERFACE_BINDING_NORMALIZATION`` event.
+
+The previous ``EDGE_SCORE`` prompt and normaliser remain registered for callers
+that replay older traces, but measured stage routes no longer invoke them.
 
 Path ranking prefers a complete workflow advertised by the public target
 contract before applying ``max_chains``. Deterministic prerequisite completion
@@ -54,7 +62,8 @@ override malformed parser placeholders; this includes Markdown-formatted field
 labels.
 
 ``max_parallel_stage_requests`` bounds independent interface-tagging and path-
-analysis calls; stateful target execution remains sequential.
+analysis calls. The single global-binding call runs after all parallel tags are
+available; stateful target execution remains sequential.
 
 ``stage_model_roles`` maps a role name to ``model_type``, ``model_name``, and
 ``model_config``. ``stage_model_routes`` maps each exact stage name to a role.
@@ -169,7 +178,7 @@ same route fragment together with the per-run trace path::
    uv run garak \
      --config scan_agent_breaker_chains_inference_hub.yaml \
      --probe_options \
-     '{"agent_breaker_chains":{"AgentBreakerChains":{"stage_model_routes":{"TOOL_INTERFACE_TAGGING":"local_base","EDGE_SCORE":"local_base","PATH_ANALYSIS":"local_base","EXPLOIT_HYPOTHESES":"local_base","STEP_PLAN":"local_base","STEP_ATTACK":"local_base","STEP_EXPLOIT":"local_base"},"stage_trace_path":"/absolute/run/path/local-base-stages.jsonl"}}}'
+     '{"agent_breaker_chains":{"AgentBreakerChains":{"stage_model_routes":{"TOOL_INTERFACE_TAGGING":"local_base","GLOBAL_INTERFACE_BINDING":"local_base","PATH_ANALYSIS":"local_base","EXPLOIT_HYPOTHESES":"local_base","STEP_PLAN":"local_base","STEP_ATTACK":"local_base","STEP_EXPLOIT":"local_base"},"stage_trace_path":"/absolute/run/path/local-base-stages.jsonl"}}}'
 
 This changes only the seven attacker stages. The utility parser remains hosted
 base Nano, and the target remains the same hosted GPT-5.2 victim gateway. The

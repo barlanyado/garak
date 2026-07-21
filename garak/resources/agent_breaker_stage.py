@@ -13,7 +13,7 @@ import uuid
 
 STAGES = (
     "TOOL_INTERFACE_TAGGING",
-    "EDGE_SCORE",
+    "GLOBAL_INTERFACE_BINDING",
     "PATH_ANALYSIS",
     "EXPLOIT_HYPOTHESES",
     "STEP_PLAN",
@@ -21,8 +21,12 @@ STAGES = (
     "STEP_EXPLOIT",
 )
 
+COMPATIBILITY_STAGES = ("EDGE_SCORE",)
+REGISTERED_STAGES = STAGES + COMPATIBILITY_STAGES
+
 STAGE_TEMPLATE_SOURCES = {
     "TOOL_INTERFACE_TAGGING": "garak/data/agent_breaker_chains/prompts.yaml",
+    "GLOBAL_INTERFACE_BINDING": "garak/data/agent_breaker_chains/prompts.yaml",
     "EDGE_SCORE": "garak/data/agent_breaker_chains/prompts.yaml",
     "PATH_ANALYSIS": "garak/data/agent_breaker_chains/prompts.yaml",
     "EXPLOIT_HYPOTHESES": "garak/data/agent_breaker_chains/prompts.yaml",
@@ -180,7 +184,7 @@ def _require_string_list(value: object, path: str, errors: list[str]) -> list:
 
 def validate_stage_output(stage: str, parsed: object) -> list[str]:
     """Validate the stable structural contract for one trainable stage."""
-    if stage not in STAGES:
+    if stage not in REGISTERED_STAGES:
         return [f"unregistered stage: {stage}"]
     errors: list[str] = []
     root = _require_mapping(parsed, "$", errors)
@@ -272,6 +276,57 @@ def validate_stage_output(stage: str, parsed: object) -> list[str]:
         ):
             if forbidden in item:
                 errors.append(f"$.{forbidden} is not part of interface contract v2")
+    elif stage == "GLOBAL_INTERFACE_BINDING":
+        bindings = _require_list(root.get("bindings"), "$.bindings", errors)
+        for index, binding in enumerate(bindings):
+            item = _require_mapping(binding, f"$.bindings[{index}]", errors)
+            for key in (
+                "producer_tool",
+                "producer_field",
+                "producer_member",
+                "consumer_tool",
+                "consumer_field",
+                "canonical_artifact",
+                "relation",
+                "support",
+                "evidence",
+            ):
+                value = item.get(key)
+                if not isinstance(value, str):
+                    errors.append(f"$.bindings[{index}].{key} must be a string")
+                elif key != "producer_member" and not value.strip():
+                    errors.append(
+                        f"$.bindings[{index}].{key} must be a non-empty string"
+                    )
+            if item.get("relation") not in {"response_member", "semantic_alias"}:
+                errors.append(f"$.bindings[{index}].relation has an invalid value")
+            if item.get("support") not in {"documented", "observed", "inferred"}:
+                errors.append(f"$.bindings[{index}].support has an invalid value")
+            if (
+                item.get("relation") == "response_member"
+                and not str(item.get("producer_member") or "").strip()
+            ):
+                errors.append(
+                    f"$.bindings[{index}].producer_member must name the response member"
+                )
+
+        preconditions = _require_list(
+            root.get("state_preconditions"), "$.state_preconditions", errors
+        )
+        for index, precondition in enumerate(preconditions):
+            item = _require_mapping(
+                precondition, f"$.state_preconditions[{index}]", errors
+            )
+            for key in ("before_tool", "after_tool", "support", "evidence"):
+                value = item.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(
+                        f"$.state_preconditions[{index}].{key} must be a non-empty string"
+                    )
+            if item.get("support") not in {"documented", "observed"}:
+                errors.append(
+                    f"$.state_preconditions[{index}].support has an invalid value"
+                )
     elif stage == "EDGE_SCORE":
         edges = _require_list(root.get("edges"), "$.edges", errors)
         for index, edge in enumerate(edges):

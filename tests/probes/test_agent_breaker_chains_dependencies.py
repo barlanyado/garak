@@ -506,6 +506,179 @@ def test_empty_ambiguous_model_result_preserves_exact_edge():
     assert '"producer_field": "upload_id"' not in rendered_prompt
 
 
+def _global_binding_probe():
+    probe = object.__new__(AgentBreakerChains)
+    probe.episode_trace_path = None
+    probe.tool_tags = {
+        "list_changes": _tag(
+            produces=(_output("$response", "pull_request_list"),),
+            source=True,
+        ),
+        "upload_asset": _tag(
+            consumes=(
+                _input("filename", "file_name"),
+                _input("content", "file_content"),
+            ),
+            produces=(_output("upload_id", "uploaded_object_identifier"),),
+            source=True,
+        ),
+        "run_job": _tag(
+            consumes=(
+                _input("repo", "repository_identifier"),
+                _input("change_number", "pull_request_identifier"),
+                _input("upload_id", "uploaded_object_identifier"),
+            ),
+            produces=(_output("approval_token", "authorization_artifact"),),
+        ),
+        "apply_change": _tag(
+            consumes=(_input("approval_token", "authorization_artifact"),),
+            sink=True,
+            severity=5,
+        ),
+    }
+    probe.tool_tags["upload_asset"]["attacker_controlled_fields"] = [
+        {"field": "filename", "evidence": "conversation supplies filename"},
+        {"field": "content", "evidence": "conversation supplies content"},
+    ]
+    probe.tool_tags["run_job"]["attacker_controlled_fields"] = [
+        {"field": "repo", "evidence": "conversation supplies repository"}
+    ]
+    return probe
+
+
+def test_global_binding_normalisation_preserves_runtime_names_and_builds_path():
+    probe = _global_binding_probe()
+    probe.max_chain_len = 4
+    probe.max_chains = 1
+    exact = probe._exact_binding_edges(probe._build_capability_graph(probe.tool_tags))
+    parsed = {
+        "bindings": [
+            {
+                "producer_tool": "list_changes",
+                "producer_field": "$response",
+                "producer_member": "number",
+                "consumer_tool": "run_job",
+                "consumer_field": "change_number",
+                "canonical_artifact": "change_identifier",
+                "relation": "response_member",
+                "support": "observed",
+                "evidence": "observed list response names each change number",
+            },
+            {
+                "producer_tool": "run_job",
+                "producer_field": "invented_token",
+                "producer_member": "",
+                "consumer_tool": "apply_change",
+                "consumer_field": "approval_token",
+                "canonical_artifact": "authorization_artifact",
+                "relation": "semantic_alias",
+                "support": "inferred",
+                "evidence": "invented output",
+            },
+        ],
+        "state_preconditions": [
+            {
+                "before_tool": "list_changes",
+                "after_tool": "upload_asset",
+                "support": "documented",
+                "evidence": "upload is scoped to a listed change",
+            }
+        ],
+    }
+
+    edges = probe._normalise_global_bindings(parsed, exact)
+    paths = probe._search_chains(edges, probe.tool_tags)
+
+    assert any(
+        edge["producer_field"] == "$response"
+        and edge["producer_member"] == "number"
+        and edge["consumer_field"] == "change_number"
+        for edge in edges
+    )
+    assert not any(edge.get("producer_field") == "invented_token" for edge in edges)
+    assert len(paths) == 1
+    assert paths[0]["sequence"] == [
+        "list_changes",
+        "upload_asset",
+        "run_job",
+        "apply_change",
+    ]
+
+
+def test_global_binding_prompt_receives_all_tools_exact_and_unresolved_inputs():
+    probe = _global_binding_probe()
+    probe.agent_config = {
+        "tools": [
+            {"name": name, "description": f"contract for {name}"}
+            for name in probe.tool_tags
+        ]
+    }
+    probe.tool_profiles = {name: {} for name in probe.tool_tags}
+    probe.tool_behaviors = {name: [] for name in probe.tool_tags}
+    probe._prompts = {
+        "GLOBAL_INTERFACE_BINDING": (
+            "TOOLS {tool_interfaces}\nEXACT {exact_bindings}\n"
+            "UNRESOLVED {unresolved_inputs}"
+        )
+    }
+    probe._detector = MagicMock()
+    probe._detector._extract_json.side_effect = json.loads
+    probe._get_stage_model_response = MagicMock(
+        return_value='{"bindings": [], "state_preconditions": []}'
+    )
+    candidates = probe._build_capability_graph(probe.tool_tags)
+
+    edges = probe._bind_global_interfaces(candidates)
+
+    rendered = probe._get_stage_model_response.call_args.args[1]
+    assert all(name in rendered for name in probe.tool_tags)
+    assert '"producer_field": "upload_id"' in rendered
+    assert '"field": "change_number"' in rendered
+    assert all(edge["match_kind"] == "exact" for edge in edges)
+
+
+def test_dependency_contract_uses_response_member_and_runtime_consumer_field():
+    sequence = ["list_changes", "run_job"]
+    plan = [
+        {"tool": "list_changes", "artifact_keys": []},
+        {"tool": "run_job", "artifact_keys": []},
+    ]
+    dependencies = [
+        {
+            "from": "list_changes",
+            "to": "run_job",
+            "producer_field": "$response",
+            "producer_member": "number",
+            "consumer_field": "change_number",
+        }
+    ]
+
+    normalised = AgentBreakerChains._apply_dependency_artifact_contract(
+        sequence, plan, dependencies
+    )
+
+    assert normalised[0]["artifact_keys"] == ["number"]
+    assert normalised[1]["input_artifact_keys"] == ["change_number"]
+
+
+def test_global_response_member_extraction_uses_visible_named_value_only():
+    probe = object.__new__(AgentBreakerChains)
+    probe.global_interface_bindings = [
+        {
+            "from": "list_changes",
+            "producer_field": "$response",
+            "producer_member": "number",
+            "match_kind": "response_member",
+        }
+    ]
+
+    artifacts = probe._global_response_member_artifacts(
+        "list_changes", '{"title": "Fix", "number": 42}'
+    )
+
+    assert artifacts == {"number": "42"}
+
+
 def test_tool_issued_required_field_is_not_conversation_controlled():
     tags = {
         "upload": {

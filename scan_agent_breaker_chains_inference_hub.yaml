@@ -102,7 +102,7 @@ plugins:
 
         stage_model_routes:
           TOOL_INTERFACE_TAGGING: hosted_baseline
-          EDGE_SCORE: hosted_baseline
+          GLOBAL_INTERFACE_BINDING: hosted_baseline
           PATH_ANALYSIS: hosted_baseline
           EXPLOIT_HYPOTHESES: hosted_baseline
           STEP_PLAN: hosted_baseline
@@ -118,7 +118,7 @@ plugins:
               extra_body:
                 chat_template_kwargs:
                   enable_thinking: false
-          EDGE_SCORE:
+          GLOBAL_INTERFACE_BINDING:
             temperature: 0.0
             top_p: 1.0
             max_tokens: 4096

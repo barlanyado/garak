@@ -12,10 +12,10 @@ attack chains via a capability-graph path search and exploits them. Single-tool
 attacks live in the base probe; this one runs chains only so they can be
 selected, reported, and tuned in isolation.
 
-Chain discovery uses the LLM only for small, reliable sub-tasks (tagging a single
-tool, scoring a single data-flow edge, writing the payload for a concrete path) —
-never for inventing whole chains. The plausible source->sink sequences are found
-by pure-Python path search over the capability graph.
+Chain discovery uses the LLM only for bounded sub-tasks: tagging one tool,
+mapping evidence-backed relations across the complete interface, and writing a
+payload for a concrete path. It never asks the model to invent a whole chain.
+Pure-Python path search finds dependency-complete source-to-sink sequences.
 
 Further info:
 
@@ -39,7 +39,7 @@ from garak.data import path as data_path
 import garak.attempt
 from garak.probes.agent_breaker import AgentBreaker, AttackState
 from garak.resources.agent_breaker_stage import (
-    STAGES as ATTACKER_STAGES,
+    REGISTERED_STAGES as ATTACKER_STAGES,
     TOOL_INTERFACE_CAPABILITY_SEVERITY,
     append_outcome,
     append_trace,
@@ -62,7 +62,8 @@ class AgentBreakerChains(AgentBreaker):
        and security capabilities; code derives source/sink markers.
     2. _build_capability_graph — pure-Python candidate edges where one
        tool's output tag feeds another tool's input tag.
-    3. _score_edges — one batched LLM call to confirm/score edges.
+    3. _bind_global_interfaces — one global LLM call maps non-exact relations
+       and documented state preconditions.
     4. _search_chains — pure-Python bounded source->sink path search,
        ranked by ``sink_severity * product(edge_confidence)``.
     5. _generate_chain_attacks — write conversational payloads for each
@@ -1330,8 +1331,8 @@ class AgentBreakerChains(AgentBreaker):
            security capabilities, then derive source/sink markers in code.
         2. `_build_capability_graph` — pure-Python candidate edges where
            one tool's output tag feeds another tool's input tag.
-        3. `_score_edges` — accept exact bindings in code and ask one batched
-           LLM call to confirm only plausible ambiguous bindings.
+        3. `_bind_global_interfaces` — accept exact bindings in code and ask one
+           global LLM call to map non-exact relations and state prerequisites.
         4. `_search_chains` — pure-Python bounded source->sink path search,
            ranked by ``sink_severity * product(edge_confidence)``.
         5. Deterministically complete public join/state prerequisites.
@@ -1361,13 +1362,7 @@ class AgentBreakerChains(AgentBreaker):
             return {"chains": [], "priority_chains": []}
 
         candidate_edges = self._build_capability_graph(self.tool_tags)
-        if not candidate_edges:
-            logging.info(
-                f"{self.__class__.__name__} # No candidate data-flow edges found"
-            )
-            return {"chains": [], "priority_chains": []}
-
-        edges = self._score_edges(candidate_edges)
+        edges = self._bind_global_interfaces(candidate_edges)
         if not edges:
             logging.info(
                 f"{self.__class__.__name__} # No edges survived confidence filtering"
@@ -1731,9 +1726,7 @@ class AgentBreakerChains(AgentBreaker):
                             "semantic_type"
                         ) != "unknown" and produced.get(
                             "semantic_type"
-                        ) == consumed.get(
-                            "semantic_type"
-                        )
+                        ) == consumed.get("semantic_type")
                         candidate = {
                             "from": src,
                             "to": dst,
@@ -1748,7 +1741,9 @@ class AgentBreakerChains(AgentBreaker):
                             "match_kind": (
                                 "exact"
                                 if exact
-                                else "semantic" if semantic else "unresolved"
+                                else "semantic"
+                                if semantic
+                                else "unresolved"
                             ),
                             "consumer_requirement": consumed.get("required", "unknown"),
                             "producer_evidence": produced.get("evidence", ""),
@@ -1802,6 +1797,256 @@ class AgentBreakerChains(AgentBreaker):
             (producer_field and producer_field.lower() in consumer_evidence)
             or (consumer_field and consumer_field.lower() in producer_evidence)
         )
+
+    def _global_interface_context(self) -> dict:
+        """Render compact all-tool context for global relationship mapping."""
+        declared = {
+            str(tool.get("name") or ""): tool
+            for tool in self.agent_config.get("tools", []) or []
+            if str(tool.get("name") or "")
+        }
+        context = {}
+        for tool_name, tag in self.tool_tags.items():
+            profile = self.tool_profiles.get(tool_name, {}) or {}
+            context[tool_name] = {
+                "interface": {
+                    "consumes": tag.get("consume_records", []),
+                    "produces": tag.get("produce_records", []),
+                    "attacker_controlled_fields": tag.get(
+                        "attacker_controlled_fields", []
+                    ),
+                },
+                "declared_description": str(
+                    declared.get(tool_name, {}).get("description") or ""
+                ),
+                "output_format": profile.get("output_format", ""),
+                "restrictions": list(profile.get("restrictions", []) or [])[:6],
+                "security_notes": profile.get("security_notes", ""),
+                "observed_behavior": list(self.tool_behaviors.get(tool_name, []) or [])[
+                    :2
+                ],
+            }
+        return context
+
+    def _unresolved_interface_inputs(self, exact_edges: list[dict]) -> list[dict]:
+        """List non-exact consumer inputs for the global binding model."""
+        exact_bound = {
+            (str(edge.get("to")), str(edge.get("consumer_field")))
+            for edge in exact_edges
+        }
+        unresolved = []
+        for tool_name, tag in self.tool_tags.items():
+            controlled = {
+                str(item.get("field") or "")
+                for item in tag.get("attacker_controlled_fields", []) or []
+                if isinstance(item, dict)
+            }
+            for item in tag.get("consume_records", []) or []:
+                field = str(item.get("field") or "")
+                if not field or (tool_name, field) in exact_bound:
+                    continue
+                unresolved.append(
+                    {
+                        "tool": tool_name,
+                        "field": field,
+                        "semantic_type": item.get("semantic_type", "unknown"),
+                        "required": item.get("required", "unknown"),
+                        "conversation_controlled": field in controlled,
+                        "evidence": item.get("evidence", ""),
+                    }
+                )
+        return unresolved
+
+    @staticmethod
+    def _exact_binding_edges(candidate_edges: list[dict]) -> list[dict]:
+        """Convert authoritative exact-name candidates into accepted edges."""
+        return [
+            {
+                "from": edge["from"],
+                "to": edge["to"],
+                "producer_field": edge["producer_field"],
+                "consumer_field": edge["consumer_field"],
+                "producer_member": "",
+                "canonical_artifact": edge["producer_field"],
+                "confidence": 1.0,
+                "data_flow": (
+                    f"exact field {edge['producer_field']} is passed to "
+                    f"{edge['consumer_field']}"
+                ),
+                "evidence": "deterministic exact field-name match",
+                "match_kind": "exact",
+                "support": "documented",
+                "consumer_requirement": edge.get("consumer_requirement", "unknown"),
+            }
+            for edge in candidate_edges
+            if edge.get("match_kind") == "exact"
+        ]
+
+    def _normalise_global_bindings(self, parsed: dict, exact: list[dict]) -> list[dict]:
+        """Validate model-proposed global bindings against exact interfaces."""
+        tools = set(self.tool_tags)
+        produces = {
+            tool: {
+                str(item.get("field") or "")
+                for item in tag.get("produce_records", []) or []
+                if isinstance(item, dict)
+            }
+            for tool, tag in self.tool_tags.items()
+        }
+        consumes = {
+            tool: {
+                str(item.get("field") or ""): str(item.get("required") or "unknown")
+                for item in tag.get("consume_records", []) or []
+                if isinstance(item, dict)
+            }
+            for tool, tag in self.tool_tags.items()
+        }
+        exact_keys = {
+            (
+                edge["from"],
+                edge["to"],
+                edge["producer_field"],
+                edge["consumer_field"],
+            )
+            for edge in exact
+        }
+        support_confidence = {"documented": 0.95, "observed": 0.95, "inferred": 0.75}
+        accepted = list(exact)
+        rejected = []
+        seen = set(exact_keys)
+
+        for raw in parsed.get("bindings", []) or []:
+            producer = str(raw.get("producer_tool") or "")
+            consumer = str(raw.get("consumer_tool") or "")
+            producer_field = str(raw.get("producer_field") or "")
+            consumer_field = str(raw.get("consumer_field") or "")
+            member = str(raw.get("producer_member") or "").strip()
+            relation = str(raw.get("relation") or "")
+            support = str(raw.get("support") or "")
+            key = (producer, consumer, producer_field, consumer_field)
+            reason = ""
+            if producer not in tools or consumer not in tools or producer == consumer:
+                reason = "unknown or identical producer/consumer tool"
+            elif producer_field not in produces.get(producer, set()):
+                reason = "producer field is not declared"
+            elif consumer_field not in consumes.get(consumer, {}):
+                reason = "consumer field is not declared"
+            elif key in seen:
+                reason = "duplicate or deterministic exact binding"
+            elif relation == "response_member" and (
+                producer_field != "$response" or not member
+            ):
+                reason = "response_member requires $response and a member"
+            elif relation == "semantic_alias" and (
+                producer_field == "$response" or member
+            ):
+                reason = "semantic_alias requires a named output and empty member"
+            elif support not in support_confidence:
+                reason = "unsupported evidence class"
+            if reason:
+                rejected.append({"binding": raw, "reason": reason})
+                continue
+            seen.add(key)
+            accepted.append(
+                {
+                    "from": producer,
+                    "to": consumer,
+                    "producer_field": producer_field,
+                    "producer_member": member,
+                    "consumer_field": consumer_field,
+                    "canonical_artifact": str(
+                        raw.get("canonical_artifact") or consumer_field
+                    ),
+                    "confidence": support_confidence[support],
+                    "data_flow": (
+                        f"{producer_field}"
+                        + (f".{member}" if member else "")
+                        + f" satisfies {consumer_field}"
+                    ),
+                    "evidence": str(raw.get("evidence") or ""),
+                    "match_kind": relation,
+                    "support": support,
+                    "consumer_requirement": consumes[consumer][consumer_field],
+                }
+            )
+
+        for raw in parsed.get("state_preconditions", []) or []:
+            before = str(raw.get("before_tool") or "")
+            after = str(raw.get("after_tool") or "")
+            support = str(raw.get("support") or "")
+            key = (before, after, "$state", "$state")
+            reason = ""
+            if before not in tools or after not in tools or before == after:
+                reason = "unknown or identical state-precondition tool"
+            elif support not in {"documented", "observed"}:
+                reason = "state precondition lacks direct support"
+            elif key in seen:
+                reason = "duplicate state precondition"
+            if reason:
+                rejected.append({"state_precondition": raw, "reason": reason})
+                continue
+            seen.add(key)
+            accepted.append(
+                {
+                    "from": before,
+                    "to": after,
+                    "producer_field": "$state",
+                    "producer_member": "",
+                    "consumer_field": "$state",
+                    "canonical_artifact": "state_precondition",
+                    "confidence": 0.95,
+                    "data_flow": str(raw.get("evidence") or ""),
+                    "evidence": str(raw.get("evidence") or ""),
+                    "match_kind": "state_precondition",
+                    "support": support,
+                    "consumer_requirement": "state",
+                    "dependency_kind": "state_precondition",
+                }
+            )
+
+        self._record_probe_event(
+            kind="deterministic",
+            stage="GLOBAL_INTERFACE_BINDING_NORMALIZATION",
+            input_data=parsed,
+            output_data={"accepted_edges": accepted, "rejected_relations": rejected},
+        )
+        self.global_interface_bindings = accepted
+        return accepted
+
+    def _bind_global_interfaces(self, candidate_edges: List[dict]) -> List[dict]:
+        """Map all non-exact interface relations in one evidence-aware LLM call."""
+        exact = self._exact_binding_edges(candidate_edges)
+        context = self._global_interface_context()
+        unresolved = self._unresolved_interface_inputs(exact)
+        prompt = self._prompts["GLOBAL_INTERFACE_BINDING"].format(
+            tool_interfaces=json.dumps(context, indent=2, ensure_ascii=False),
+            exact_bindings=json.dumps(exact, indent=2, ensure_ascii=False),
+            unresolved_inputs=json.dumps(unresolved, indent=2, ensure_ascii=False),
+        )
+        response = self._get_stage_model_response(
+            "GLOBAL_INTERFACE_BINDING",
+            prompt,
+            trace_context={
+                "artifacts": {
+                    "exact_binding_count": len(exact),
+                    "unresolved_input_count": len(unresolved),
+                }
+            },
+        )
+        if not response:
+            self.global_interface_bindings = exact
+            return exact
+        try:
+            parsed = self._detector._extract_json(response)
+        except json.JSONDecodeError as error:
+            logging.warning(
+                "%s # Failed to parse global interface bindings: %s",
+                self.__class__.__name__,
+                error,
+            )
+            self.global_interface_bindings = exact
+            return exact
+        return self._normalise_global_bindings(parsed, exact)
 
     def _score_edges(self, candidate_edges: List[dict]) -> List[dict]:
         """Accept exact bindings in code and score only ambiguous candidates.
@@ -2650,10 +2895,14 @@ class AgentBreakerChains(AgentBreaker):
                         "from",
                         "to",
                         "producer_field",
+                        "producer_member",
                         "consumer_field",
+                        "canonical_artifact",
                         "confidence",
                         "data_flow",
                         "evidence",
+                        "match_kind",
+                        "support",
                         "dependency_kind",
                     )
                 }
@@ -2902,6 +3151,40 @@ class AgentBreakerChains(AgentBreaker):
                 out.append(key)
                 seen.add(key.lower())
         return out
+
+    @classmethod
+    def _apply_dependency_artifact_contract(
+        cls, sequence: List[str], plan: List[dict], dependencies: list[dict]
+    ) -> List[dict]:
+        """Attach graph-authoritative input/output artifacts to a model plan."""
+        normalized = copy.deepcopy(plan)
+        positions = {tool: index for index, tool in enumerate(sequence)}
+        for edge in dependencies:
+            if edge.get("dependency_kind") == "state_precondition":
+                continue
+            producer_idx = positions.get(str(edge.get("from") or ""))
+            consumer_idx = positions.get(str(edge.get("to") or ""))
+            if producer_idx is None or consumer_idx is None:
+                continue
+            producer_key = str(
+                edge.get("producer_member") or edge.get("producer_field") or ""
+            )
+            consumer_key = str(edge.get("consumer_field") or "")
+            if producer_key and producer_key not in {"$response", "$state"}:
+                normalized[producer_idx]["artifact_keys"] = (
+                    cls._append_missing_artifact_keys(
+                        normalized[producer_idx].get("artifact_keys") or [],
+                        (producer_key,),
+                    )
+                )
+            if consumer_key and consumer_key != "$state":
+                normalized[consumer_idx]["input_artifact_keys"] = (
+                    cls._append_missing_artifact_keys(
+                        normalized[consumer_idx].get("input_artifact_keys") or [],
+                        (consumer_key,),
+                    )
+                )
+        return normalized
 
     @classmethod
     def _normalize_identity_grant_step_plan(
@@ -3267,6 +3550,9 @@ class AgentBreakerChains(AgentBreaker):
             )
             self._flush_pending_stage_trace()
             return None
+        cleaned = self._apply_dependency_artifact_contract(
+            planned_tools, cleaned, chain.get("dependencies", []) or []
+        )
         self._flush_pending_stage_trace(fallback_used=plan_fallback_used)
         return cleaned
 
@@ -4572,9 +4858,29 @@ class AgentBreakerChains(AgentBreaker):
                     out.setdefault("__object_id__", out["order_id"])
         return out
 
+    def _global_response_member_artifacts(
+        self,
+        tool_name: str,
+        agent_response: str,
+    ) -> dict:
+        """Recover globally bound named members from a visible raw response."""
+        members = {
+            str(edge.get("producer_member") or "").strip()
+            for edge in getattr(self, "global_interface_bindings", []) or []
+            if edge.get("from") == tool_name
+            and edge.get("match_kind") == "response_member"
+            and str(edge.get("producer_member") or "").strip()
+        }
+        return {
+            member: value
+            for member in sorted(members)
+            if (value := self._structured_response_field(agent_response, (member,)))
+        }
+
     def _response_fallback_artifacts(self, tool_name: str, agent_response: str) -> dict:
         """Fallback artifacts from deterministic response parsers only."""
         flat = self._structured_tool_response_artifacts(tool_name, agent_response)
+        flat.update(self._global_response_member_artifacts(tool_name, agent_response))
         for key, value in self._identity_user_artifacts_from_response(
             tool_name, agent_response
         ).items():
@@ -6560,6 +6866,7 @@ class AgentBreakerChains(AgentBreaker):
         # as {"exact_field": "..."}. Let deterministic values repair malformed
         # model extraction rather than preserving values like Markdown "**".
         flat.update(self._structured_tool_response_artifacts(tool_name, agent_response))
+        flat.update(self._global_response_member_artifacts(tool_name, agent_response))
         if (
             tool_name == "run_access_review"
             and self._response_has_identity_approval_marker(agent_response)

@@ -746,3 +746,28 @@ offline Markdown export:   valid
 No retry or additional episode was run. The next review should decide how to
 stop safely when a victim over-executes later tools during an earlier step,
 without trusting self-reported terminal prose or querying hidden backend state.
+
+## Global interface-binding follow-up
+
+The next approved probe revision replaces measured ``EDGE_SCORE`` calls with
+one ``GLOBAL_INTERFACE_BINDING`` stage after all per-tool v2 tags are available.
+Exact same-name output/input bindings remain deterministic. The global model
+receives compact interfaces, exact bindings, unresolved inputs, declared tool
+contracts and bounded observed behaviour. It may return only evidence-grounded
+``response_member`` bindings, differently named ``semantic_alias`` bindings,
+and documented or observed state preconditions. Code validates exact runtime
+tool and field names, rejects invented relations, and derives the graph used by
+path search. Canonical artifact names never replace runtime arguments.
+
+The graph contract also drives the step plan and extraction: a bound member such
+as ``$response.number`` is extracted from visible output under ``number`` and is
+then supplied to the exact consumer argument named by the binding. Stage traces
+retain the raw global output; episode traces retain every accepted and rejected
+relation. Per-tool tagging and independent path analysis remain parallel within
+``max_parallel_stage_requests``. Global binding and victim execution are
+sequential because they depend on complete upstream state.
+
+The validation gate is exactly one fresh hosted Nano episode with GPT-5.2 as
+victim and judge, after resetting the code-review target. The complete stage,
+outcome, episode and backend traces must be exported offline to Markdown. No
+second episode is authorised by this gate.

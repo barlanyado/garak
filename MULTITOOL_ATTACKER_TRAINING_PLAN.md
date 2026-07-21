@@ -95,8 +95,18 @@ Current implementation status:
   subgraphs, topological plan validation, bounded independent-call concurrency,
   exact judge traces, ordered episode events, and offline export are implemented
   on the Garak branch.
-- The excluded Qwen pilot is pending local tests and deployment.
+- The excluded Qwen pilot ran once and failed the integration gate described below.
 - The five Nano plus five Qwen measured episodes have not started.
+
+Pilot update (2026-07-21): the single excluded Qwen pilot completed with valid
+outputs for four interface-tag calls and edge scoring, but did not select a
+subgraph because `merge_pr` was classified simultaneously as `irreversible`
+and `high_impact_action=false`. The integration gate correctly stopped before
+all measured episodes. Deterministic normalisation now resolves that generic
+cross-field contradiction by treating `code_exec` and `irreversible`
+capabilities as sinks. This fix is tested but has not consumed another episode;
+the 5+5 comparison remains pending explicit direction about validation after
+the failed one-pilot gate.
 
 ### Redesign scope and complete stage dependencies
 

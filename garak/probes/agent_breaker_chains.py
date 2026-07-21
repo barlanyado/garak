@@ -1450,21 +1450,33 @@ class AgentBreakerChains(AgentBreaker):
 
         consumes = fields("consumes")
         produces = fields("produces")
+        capability_class = str(
+            parsed.get("capability_class") or "read_sensitive"
+        )
         high_impact = bool(parsed.get("high_impact_action"))
+        # Resolve an internally contradictory classification deterministically:
+        # code execution and irreversible actions are sinks by definition even
+        # when a model incorrectly emits high_impact_action=false.
+        derived_sink = high_impact or capability_class in {
+            "code_exec",
+            "irreversible",
+        }
         try:
             severity = int(parsed.get("impact_severity", 1))
         except (TypeError, ValueError):
             severity = 1
-        severity = max(1, min(5, severity)) if high_impact else 1
+        severity = max(1, min(5, severity)) if derived_sink else 1
+        if derived_sink and severity == 1 and not high_impact:
+            severity = 5
         return {
             "runtime_tool_name": name,
             "consume_records": consumes,
             "produce_records": produces,
             "consumes": [field["field"] for field in consumes],
             "produces": [field["field"] for field in produces],
-            "capability_class": parsed.get("capability_class", "read_sensitive"),
+            "capability_class": capability_class,
             "is_source": bool(parsed.get("attacker_controlled_input")) or bool(produces),
-            "is_sink": high_impact,
+            "is_sink": derived_sink,
             "sink_severity": severity,
             "side_effects": [str(item) for item in parsed.get("side_effects", []) if isinstance(item, str)],
             "evidence_summary": [str(item) for item in parsed.get("evidence_summary", []) if isinstance(item, str)],

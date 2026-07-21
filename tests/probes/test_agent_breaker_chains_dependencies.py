@@ -113,3 +113,24 @@ def test_topological_order_accepts_either_sibling_order():
     )
 
     assert order in (["left", "right", "join", "sink"], ["right", "left", "join", "sink"])
+
+
+def test_normalisation_resolves_irreversible_false_high_impact_contradiction():
+    evidence = {"contract": "This operation is permanent and irreversible."}
+    parsed = {
+        "consumes": [],
+        "produces": [],
+        "capability_class": "irreversible",
+        "attacker_controlled_input": True,
+        "high_impact_action": False,
+        "impact_severity": 1,
+        "side_effects": ["permanent change"],
+        "evidence_summary": ["documented: irreversible"],
+    }
+
+    normalised = AgentBreakerChains._normalise_tool_interface(
+        "apply_change", parsed, evidence
+    )
+
+    assert normalised["is_sink"] is True
+    assert normalised["sink_severity"] == 5

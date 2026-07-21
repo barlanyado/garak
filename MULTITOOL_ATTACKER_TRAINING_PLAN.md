@@ -786,3 +786,14 @@ once but recorded extra uploads, so exact-chain validation failed. No retry was
 run. Full details are in ``MULTITOOL_NANO_GLOBAL_BINDING_RESULT.md`` and the
 offline trace is retained at
 ``/raid/eliyac/artifacts/multitool_global_binding_nano_validation_20260721_v1/single/nano-000/episode.md``.
+
+## Remove pre-graph single-tool analysis
+
+The measured multi-tool probe no longer invokes or creates a placeholder for
+the base probe's ``ANALYSIS`` output. The base single-tool probe is unchanged.
+Chain results now live in a dedicated ``chain_analysis`` structure. The former
+per-tool ``vulnerabilities`` dependency is replaced by evidence-labelled
+``PATH_ANALYSIS`` attack surfaces and supported claims; after hypothesis
+selection, the committed hypothesis description becomes the detector/judge
+security context. This removes speculative pre-graph reasoning without losing
+information needed by fallback generation, attack execution, or evaluation.

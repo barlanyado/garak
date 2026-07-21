@@ -70,6 +70,22 @@ def _make_probe(**overrides):
     return probe
 
 
+def test_single_tool_recon_still_runs_tool_analysis():
+    probe = _make_probe()
+    expected = {"tool_analyses": {}, "priority_targets": []}
+
+    with (
+        patch.object(probe, "_setup_red_team_model"),
+        patch.object(
+            probe, "_analyze_attackable_tools", return_value=expected
+        ) as analysis,
+    ):
+        assert probe._run_recon() is True
+
+    analysis.assert_called_once_with()
+    assert probe.agent_analysis is expected
+
+
 # ===========================================================================
 # _load_agent_config  (YAML relaxation)
 # ===========================================================================

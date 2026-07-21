@@ -406,6 +406,58 @@ class TestFormatChainDataFlow:
             AgentBreakerChains._format_chain_data_flow([]) == "(no data flow recorded)"
         )
 
+    def test_path_risk_context_replaces_removed_single_tool_analysis(self):
+        context = AgentBreakerChains._format_path_risk_context(
+            {
+                "path_analysis": {
+                    "summary": "complete authorization workflow",
+                    "attack_surfaces": ["token binding at the terminal action"],
+                    "claims": [
+                        {
+                            "status": "hypothesis",
+                            "claim": "authorization may be reusable",
+                        },
+                        {"status": "unsupported", "claim": "invented weakness"},
+                    ],
+                }
+            }
+        )
+
+        assert context == (
+            "token binding at the terminal action | authorization may be reusable"
+        )
+
+    def test_committed_hypothesis_becomes_judge_context(self):
+        probe = _make_probe()
+        probe.tool_tags = {"sink": {"delivery": "direct"}}
+        hypothesis = {
+            "technique": "token_rebinding",
+            "description": "Test whether authorization can cross object boundaries.",
+            "payload_shape": "bound token plus a different object",
+            "sink_requirement": "terminal mutation succeeds",
+        }
+        plan = [
+            {"tool": "source", "role": "recon"},
+            {"tool": "sink", "role": "exploit"},
+        ]
+        path = {
+            "sequence": ["source", "sink"],
+            "edges": [],
+            "dependencies": [],
+            "score": 1.0,
+            "path_analysis": {"summary": "authorization workflow"},
+        }
+
+        with (
+            patch.object(
+                probe, "_generate_exploit_hypotheses", return_value=[hypothesis]
+            ),
+            patch.object(probe, "_generate_step_plan", return_value=plan),
+        ):
+            result = probe._generate_chain_attacks([path])
+
+        assert result["chains"][0]["vulnerabilities"] == hypothesis["description"]
+
 
 # ===========================================================================
 # _build_chain_configs ordering
@@ -415,7 +467,7 @@ class TestFormatChainDataFlow:
 class TestBuildChainConfigs:
     def test_priority_chains_first(self):
         probe = _make_probe()
-        probe.agent_analysis = {
+        probe.chain_analysis = {
             "chains": [
                 {"chain_id": "chain_1", "entry_tool": "a", "attack_prompts": ["x"]},
                 {"chain_id": "chain_2", "entry_tool": "b", "attack_prompts": ["x"]},
@@ -429,7 +481,7 @@ class TestBuildChainConfigs:
 
     def test_falls_back_to_sequence_entry(self):
         probe = _make_probe()
-        probe.agent_analysis = {
+        probe.chain_analysis = {
             "chains": [
                 {"chain_id": "chain_1", "sequence": ["x", "y"], "attack_prompts": ["p"]}
             ],
@@ -440,7 +492,7 @@ class TestBuildChainConfigs:
 
     def test_prioritizes_completion_path_over_shallow_incidental_chains(self):
         probe = _make_probe(max_active_chains=4)
-        probe.agent_analysis = {
+        probe.chain_analysis = {
             "chains": [
                 {
                     "chain_id": "chain_1",
@@ -479,7 +531,7 @@ class TestBuildChainConfigs:
 
     def test_caps_expanded_active_chains_after_completion_priority(self):
         probe = _make_probe(max_active_chains=2)
-        probe.agent_analysis = {
+        probe.chain_analysis = {
             "chains": [
                 {
                     "chain_id": "chain_1",
@@ -916,10 +968,6 @@ class TestCompactAnalysisContext:
 
 
 class TestChainOrchestration:
-    _SINGLE_ANALYSIS = {
-        "tool_analyses": {"file_reader": {"attack_prompts": ["x"]}},
-        "priority_targets": [],
-    }
     _CHAIN_RESULT = {
         "chains": [
             {
@@ -952,9 +1000,7 @@ class TestChainOrchestration:
         probe = _make_probe()
         with (
             patch.object(probe, "_setup_red_team_model"),
-            patch.object(
-                probe, "_analyze_attackable_tools", return_value=self._SINGLE_ANALYSIS
-            ),
+            patch.object(probe, "_analyze_attackable_tools") as mock_analysis,
             patch.object(
                 probe, "_analyze_tool_chains", return_value=self._CHAIN_RESULT
             ),
@@ -966,6 +1012,7 @@ class TestChainOrchestration:
             ) as mock_chain,
         ):
             list(probe._create_init_attempts())
+        mock_analysis.assert_not_called()
         mock_single.assert_not_called()
         mock_chain.assert_called_once()
 
@@ -974,24 +1021,21 @@ class TestChainOrchestration:
         probe = _make_probe(max_chain_len=4, max_step_attempts=2)
         with (
             patch.object(probe, "_setup_red_team_model"),
-            patch.object(
-                probe, "_analyze_attackable_tools", return_value=self._SINGLE_ANALYSIS
-            ),
+            patch.object(probe, "_analyze_attackable_tools") as mock_analysis,
             patch.object(
                 probe, "_analyze_tool_chains", return_value=self._CHAIN_RESULT
             ),
             patch.object(probe, "_attack_single_chain", return_value=[MagicMock()]),
         ):
             list(probe._create_init_attempts())
+        mock_analysis.assert_not_called()
         assert probe.max_calls_per_conv == 1 * 4 * 2
 
     def test_no_chains_returns_empty(self):
         probe = _make_probe()
         with (
             patch.object(probe, "_setup_red_team_model"),
-            patch.object(
-                probe, "_analyze_attackable_tools", return_value=self._SINGLE_ANALYSIS
-            ),
+            patch.object(probe, "_analyze_attackable_tools") as mock_analysis,
             patch.object(
                 probe,
                 "_analyze_tool_chains",
@@ -1002,6 +1046,7 @@ class TestChainOrchestration:
             ) as mock_chain,
         ):
             result = list(probe._create_init_attempts())
+        mock_analysis.assert_not_called()
         assert result == []
         mock_chain.assert_not_called()
 
@@ -2315,7 +2360,6 @@ class TestDeliveryPropagation:
 
     def test_chain_inherits_data_channel_from_sink(self):
         probe = _make_probe()
-        probe.agent_analysis = {}
         probe.tool_tags = {
             "a": {"delivery": "direct"},
             "b": {"delivery": "data_channel"},
@@ -2325,14 +2369,12 @@ class TestDeliveryPropagation:
 
     def test_chain_defaults_to_direct_when_sink_untagged(self):
         probe = _make_probe()
-        probe.agent_analysis = {}
         probe.tool_tags = {}
         result = self._gen(probe, [{"sequence": ["a", "b"], "edges": [], "score": 1.0}])
         assert result["chains"][0]["delivery"] == "direct"
 
     def test_invalid_delivery_value_falls_back_to_direct(self):
         probe = _make_probe()
-        probe.agent_analysis = {}
         probe.tool_tags = {"b": {"delivery": "garbage"}}
         result = self._gen(probe, [{"sequence": ["a", "b"], "edges": [], "score": 1.0}])
         assert result["chains"][0]["delivery"] == "direct"

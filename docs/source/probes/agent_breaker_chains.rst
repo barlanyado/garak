@@ -35,6 +35,15 @@ Unknown security-relevant capabilities use ``other_security_impact`` at severity
 output is retained in the stage trace and the normalized interface plus derived
 graph policy is retained as a ``TOOL_INTERFACE_NORMALIZATION`` episode event.
 
+The chain probe does not run the base probe's speculative single-tool
+``ANALYSIS`` stage. Discovery, deep recon and optional behavioural observations
+feed interface tagging directly. Security reasoning begins after the complete
+dependency graph exists in ``PATH_ANALYSIS``. Downstream fallback and judge
+context comes from evidence-labelled path analysis, then from the committed
+``EXPLOIT_HYPOTHESES`` description; chain storage is independent of the base
+probe's ``agent_analysis`` structure. The single-tool Agent Breaker probe keeps
+its original ``ANALYSIS`` behaviour.
+
 After all tools are tagged, code reconciles direct-control claims across the
 complete interface set. A required input with an exact field issued by another
 tool is not treated as directly conversation-controlled, even when an isolated

@@ -159,6 +159,7 @@ class AgentBreaker(garak.probes.IterativeProbe):
     tier = garak.probes.Tier.INFORMATIONAL
     active = False  # Requires red team model configuration
     parallelisable_attempts = False  # Multi-turn probes manage their own dialog
+    run_tool_analysis = True
 
     DEFAULT_PARAMS = garak.probes.IterativeProbe.DEFAULT_PARAMS | {
         "red_team_model_type": "nim",
@@ -1143,12 +1144,12 @@ class AgentBreaker(garak.probes.IterativeProbe):
         )
 
     def _run_recon(self) -> bool:
-        """Set up models and run shared recon: discovery, deep recon, analysis.
+        """Set up models and run shared discovery and tool reconnaissance.
 
-        Populates ``self.tool_profiles`` and ``self.agent_analysis``. Returns
-        ``False`` (and logs) when no tools are available to attack. Shared by
-        both the single-tool probe and the chain probe so recon logic lives in
-        one place.
+        Populates ``self.tool_profiles`` and, when ``run_tool_analysis`` is
+        enabled, ``self.agent_analysis``. Returns ``False`` (and logs) when no
+        tools are available to attack. Shared by both the single-tool probe and
+        the chain probe so recon logic lives in one place.
         """
         self._setup_red_team_model()
 
@@ -1185,10 +1186,11 @@ class AgentBreaker(garak.probes.IterativeProbe):
                     self.generator
                 )
 
-        logging.info(
-            f"{self.__class__.__name__} # Analyzing agent tools for weaknesses..."
-        )
-        self.agent_analysis = self._analyze_attackable_tools()
+        if self.run_tool_analysis:
+            logging.info(
+                f"{self.__class__.__name__} # Analyzing agent tools for weaknesses..."
+            )
+            self.agent_analysis = self._analyze_attackable_tools()
         return True
 
     def _create_init_attempts(self) -> Iterable[garak.attempt.Attempt]:

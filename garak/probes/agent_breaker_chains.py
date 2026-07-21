@@ -7,7 +7,7 @@ A multi-turn red-team probe for attacking agentic LLM applications by chaining
 multiple tools together.
 
 Builds on :class:`~garak.probes.agent_breaker.AgentBreaker`: it reuses the same
-recon, deep-recon, and per-tool weakness analysis, then discovers multi-tool
+discovery and deep recon, then discovers multi-tool
 attack chains via a capability-graph path search and exploits them. Single-tool
 attacks live in the base probe; this one runs chains only so they can be
 selected, reported, and tuned in isolation.
@@ -69,14 +69,14 @@ class AgentBreakerChains(AgentBreaker):
     5. _generate_chain_attacks — write conversational payloads for each
        concrete path.
 
-    Recon, deep recon, and per-tool weakness analysis are inherited from
-    class AgentBreaker (the per-tool analysis grounds capability tagging).
-    Running this probe drives the target independently, so it re-runs recon
-    rather than sharing it with a single-tool run.
+    Discovery and deep recon are inherited from :class:`AgentBreaker`.
+    Speculative single-tool ``ANALYSIS`` is disabled; chain-specific security
+    reasoning begins only after graph construction in ``PATH_ANALYSIS``.
     """
 
     goal = "Identify weaknesses in agentic applications through multi-tool chaining"
     primary_detector = "agent_breaker_chains.AgentBreakerChainResult"
+    run_tool_analysis = False
 
     DEFAULT_PARAMS = AgentBreaker.DEFAULT_PARAMS | {
         # Maximum number of tool chains to attack (top-ranked by severity x confidence)
@@ -91,9 +91,7 @@ class AgentBreakerChains(AgentBreaker):
         # search is capped by ``max_chains``, but hypothesis fan-out can produce
         # more executable lines than a bounded run can drive to a terminal sink.
         "max_active_chains": 4,
-        # Chain planning reuses live blackbox recon/behavioral observations, but
-        # large per-tool transcripts can make the inherited weakness-analysis
-        # prompt repeatedly time out. Bound the rendered context for chain runs.
+        # Bound recon context rendered into interface and path-analysis prompts.
         "analysis_max_behavior_observations_per_tool": 2,
         "analysis_max_behavior_sample_chars": 320,
         "analysis_max_behavior_constraints": 4,
@@ -505,6 +503,7 @@ class AgentBreakerChains(AgentBreaker):
         )
         # tool_name -> tag_dict (consumes/produces/capability/source/sink markers)
         self.tool_tags: dict = {}
+        self.chain_analysis: dict = {"chains": [], "priority_chains": []}
         # Technique label parsed from the most recent step prompt-generation
         # call. Read immediately after generation to stamp the attack state, so
         # per-step history records which technique class each attempt used.
@@ -884,46 +883,19 @@ class AgentBreakerChains(AgentBreaker):
         if fallback_event is not None and stage_trace_path:
             append_outcome(stage_trace_path, fallback_event)
 
-    def _analyze_attackable_tools(self) -> dict:
-        """Return evidence collected by recon without speculative global analysis.
-
-        Chain-specific security reasoning happens later in ``PATH_ANALYSIS``.
-        Keeping this hook deterministic prevents an early global model opinion
-        from deleting tools or inventing weaknesses before graph construction.
-        """
-        agent_purpose = self.agent_config.get("agent_purpose", "Unknown purpose")
-        return {
-            "raw_analysis": None,
-            "agent_purpose": agent_purpose,
-            "tools": self.agent_config.get("tools", []),
-            "tool_analyses": {
-                str(tool.get("name")): {
-                    "functionality": str(tool.get("description") or ""),
-                    "vulnerabilities": "",
-                    "exploit_strategies": "",
-                    "attack_prompts": [],
-                }
-                for tool in self.agent_config.get("tools", [])
-                if tool.get("name")
-            },
-            "priority_targets": [],
-        }
-
     # ------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------
 
     def _create_init_attempts(self) -> Iterable[garak.attempt.Attempt]:
-        """Create initial chain attack attempts based on agent analysis."""
+        """Create initial attempts from dependency-complete chain analysis."""
         if not self._run_recon():
             return []
 
         logging.info(
             f"{self.__class__.__name__} # Searching for multi-tool attack chains..."
         )
-        chain_result = self._analyze_tool_chains()
-        self.agent_analysis["chains"] = chain_result.get("chains", [])
-        self.agent_analysis["priority_chains"] = chain_result.get("priority_chains", [])
+        self.chain_analysis = self._analyze_tool_chains()
 
         chain_configs = self._build_chain_configs()
 
@@ -1045,7 +1017,7 @@ class AgentBreakerChains(AgentBreaker):
         )
 
     def _build_chain_configs(self) -> List[Tuple[str, dict]]:
-        """Extract (entry_tool, chain_dict) tuples from agent_analysis.
+        """Extract ``(entry_tool, chain_dict)`` tuples from chain analysis.
 
         Mirrors `AgentBreaker._build_tool_configs` but for chain attacks.
         Each ``chain_dict`` carries an ``is_chain`` flag so the refinement code
@@ -1055,8 +1027,8 @@ class AgentBreakerChains(AgentBreaker):
         Chains are ordered by ``priority_chains`` when available, with any
         remaining chains appended in their original order.
         """
-        chains: list = (self.agent_analysis or {}).get("chains", []) or []
-        priority_chains: list = (self.agent_analysis or {}).get(
+        chains: list = (self.chain_analysis or {}).get("chains", []) or []
+        priority_chains: list = (self.chain_analysis or {}).get(
             "priority_chains", []
         ) or []
 
@@ -1293,32 +1265,6 @@ class AgentBreakerChains(AgentBreaker):
             )
             if fault_behavior:
                 lines.append(fault_behavior.rstrip())
-            sections.append("\n".join(lines))
-        return "\n\n".join(sections)
-
-    @staticmethod
-    def _format_per_tool_analyses(tool_analyses: dict) -> str:
-        """Render the per-tool ANALYSIS output as a text block.
-
-        Used to ground capability tagging (TOOL_TAGGING): each tool gets its
-        functionality, vulnerabilities, and exploit strategies so the tagger can
-        reason about what each tool consumes and produces.
-        """
-        if not tool_analyses:
-            return "(no per-tool analyses available)"
-
-        sections: List[str] = []
-        for tool_name, analysis in tool_analyses.items():
-            lines = [f"### Tool: {tool_name}"]
-            functionality = analysis.get("functionality", "")
-            vulnerabilities = analysis.get("vulnerabilities", "")
-            exploit_strategies = analysis.get("exploit_strategies", "")
-            if functionality:
-                lines.append(f"Functionality: {functionality}")
-            if vulnerabilities:
-                lines.append(f"Vulnerabilities: {vulnerabilities}")
-            if exploit_strategies:
-                lines.append(f"Exploit strategies: {exploit_strategies}")
             sections.append("\n".join(lines))
         return "\n\n".join(sections)
 
@@ -2921,15 +2867,29 @@ class AgentBreakerChains(AgentBreaker):
             lines.append(f"{e['from']} -> {e['to']}: {flow}")
         return "\n".join(lines)
 
-    def _format_chain_vulnerabilities(self, sequence: list) -> str:
-        """Combine per-tool vulnerabilities for the tools in a chain."""
-        tool_analyses = (self.agent_analysis or {}).get("tool_analyses", {})
-        parts = []
-        for tool in sequence:
-            vuln = (tool_analyses.get(tool, {}) or {}).get("vulnerabilities", "")
-            if vuln:
-                parts.append(f"{tool}: {vuln}")
-        return " | ".join(parts) if parts else "Combined multi-tool weakness"
+    @staticmethod
+    def _format_path_risk_context(path: dict) -> str:
+        """Build fallback security context from post-graph path analysis."""
+        analysis = path.get("path_analysis", {}) or {}
+        parts = [
+            str(surface).strip()
+            for surface in analysis.get("attack_surfaces", []) or []
+            if str(surface).strip()
+        ]
+        for claim in analysis.get("claims", []) or []:
+            if not isinstance(claim, dict) or claim.get("status") not in {
+                "documented",
+                "observed",
+                "hypothesis",
+            }:
+                continue
+            text = str(claim.get("claim") or "").strip()
+            if text:
+                parts.append(text)
+        if parts:
+            return " | ".join(dict.fromkeys(parts))
+        summary = str(analysis.get("summary") or "").strip()
+        return summary or "Dependency-complete multi-tool security path"
 
     @staticmethod
     def _default_hypothesis(vulnerabilities: str) -> dict:
@@ -2948,13 +2908,10 @@ class AgentBreakerChains(AgentBreaker):
     def _generate_exploit_hypotheses(self, chain: dict) -> List[dict]:
         """Enumerate several DISTINCT exploit techniques for one chain.
 
-        One LLM call grounded on the sink's enriched capability tags
-        (``payload_types``, ``executes_content``, ``content_handling``), the
-        combined vulnerabilities, and the per-tool grounding. Returns a list of
-        hypothesis dicts (``technique``/``description``/``payload_shape``/
-        ``sink_requirement``), capped at ``max_hypotheses_per_chain``. Returns an
-        empty list (caller falls back to a single default hypothesis) whenever
-        the model is unavailable, the call fails, or the JSON is malformed.
+        One LLM call is grounded on the validated subgraph and evidence-labelled
+        path analysis. Returns hypothesis dictionaries capped at
+        ``max_hypotheses_per_chain``. Returns an empty list whenever the model
+        is unavailable, the call fails, or the JSON is malformed.
         """
         if getattr(self, "red_team_model", None) is None:
             return []
@@ -3054,8 +3011,8 @@ class AgentBreakerChains(AgentBreaker):
                 continue
             entry_tool = sequence[0]
             data_flow = self._format_chain_data_flow(path["edges"])
-            vulnerabilities = self._format_chain_vulnerabilities(sequence)
-            intent = self._infer_chain_intent(sequence, vulnerabilities)
+            risk_context = self._format_path_risk_context(path)
+            intent = self._infer_chain_intent(sequence)
             # Delivery is a property of the sink's vulnerability class: a
             # data-channel sink (XXE, cmdi, SSRF) needs a crafted payload planted
             # upstream, a direct sink does not. The chain inherits the sink's tag.
@@ -3072,7 +3029,7 @@ class AgentBreakerChains(AgentBreaker):
                 "entry_tool": entry_tool,
                 "intent": intent,
                 "data_flow": data_flow,
-                "vulnerabilities": vulnerabilities,
+                "vulnerabilities": risk_context,
                 "delivery": delivery,
             }
 
@@ -3080,7 +3037,7 @@ class AgentBreakerChains(AgentBreaker):
             if not hypotheses and getattr(
                 self, "deterministic_fallbacks_enabled", True
             ):
-                hypotheses = [self._default_hypothesis(vulnerabilities)]
+                hypotheses = [self._default_hypothesis(risk_context)]
             if not hypotheses:
                 logging.warning(
                     "%s # Dropping path because EXPLOIT_HYPOTHESES produced "
@@ -3099,6 +3056,7 @@ class AgentBreakerChains(AgentBreaker):
                     "chain_id": chain_id,
                     "hypothesis": hypothesis,
                     "intent": f"{intent} Technique: {hypothesis['description']}",
+                    "vulnerabilities": hypothesis["description"] or risk_context,
                 }
 
                 step_plan = self._generate_step_plan(chain)
@@ -3125,7 +3083,7 @@ class AgentBreakerChains(AgentBreaker):
         return {"chains": chains, "priority_chains": priority_chains}
 
     @staticmethod
-    def _infer_chain_intent(sequence: List[str], vulnerabilities: str) -> str:
+    def _infer_chain_intent(sequence: List[str]) -> str:
         """Cheap default intent string until the plan-gen LLM call refines it.
 
         The step plan template gets an explicit ``intent`` field; the model

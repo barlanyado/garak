@@ -40,6 +40,7 @@ import garak.attempt
 from garak.probes.agent_breaker import AgentBreaker, AttackState
 from garak.resources.agent_breaker_stage import (
     STAGES as ATTACKER_STAGES,
+    TOOL_INTERFACE_CAPABILITY_SEVERITY,
     append_outcome,
     append_trace,
     make_fallback_event,
@@ -57,8 +58,8 @@ class AgentBreakerChains(AgentBreaker):
     Discovers and attacks multi-tool chains using a capability-graph path
     search:
 
-    1. _tag_tool_capabilities — tag every tool with what it
-       consumes/produces, its capability class, and source/sink markers.
+    1. _tag_tool_capabilities — extract each tool's evidence-grounded interface
+       and security capabilities; code derives source/sink markers.
     2. _build_capability_graph — pure-Python candidate edges where one
        tool's output tag feeds another tool's input tag.
     3. _score_edges — one batched LLM call to confirm/score edges.
@@ -536,7 +537,9 @@ class AgentBreakerChains(AgentBreaker):
         lock = getattr(self, "_stage_trace_lock", None)
 
         def append() -> None:
-            self._episode_event_sequence = getattr(self, "_episode_event_sequence", 0) + 1
+            self._episode_event_sequence = (
+                getattr(self, "_episode_event_sequence", 0) + 1
+            )
             append_trace(
                 path,
                 make_episode_event(
@@ -1323,8 +1326,8 @@ class AgentBreakerChains(AgentBreaker):
 
         Pipeline (each LLM step is a small, reliable sub-task):
 
-        1. `_tag_tool_capabilities` — tag every tool with what it
-           consumes/produces, its capability class, and source/sink markers.
+        1. `_tag_tool_capabilities` — extract every tool's interface and
+           security capabilities, then derive source/sink markers in code.
         2. `_build_capability_graph` — pure-Python candidate edges where
            one tool's output tag feeds another tool's input tag.
         3. `_score_edges` — one batched LLM call to confirm/score edges.
@@ -1375,7 +1378,9 @@ class AgentBreakerChains(AgentBreaker):
     def _tag_tool_capabilities(self) -> dict:
         """Classify each interface independently and bind names in code."""
         agent_purpose = self.agent_config.get("agent_purpose", "Unknown purpose")
-        tools = [tool for tool in self.agent_config.get("tools", []) if tool.get("name")]
+        tools = [
+            tool for tool in self.agent_config.get("tools", []) if tool.get("name")
+        ]
 
         def classify(tool: dict) -> Tuple[str, Optional[dict]]:
             name = str(tool["name"])
@@ -1401,9 +1406,22 @@ class AgentBreakerChains(AgentBreaker):
             try:
                 parsed = self._detector._extract_json(response)
             except json.JSONDecodeError as error:
-                logging.warning("%s # Failed to parse interface for %s: %s", self.__class__.__name__, name, error)
+                logging.warning(
+                    "%s # Failed to parse interface for %s: %s",
+                    self.__class__.__name__,
+                    name,
+                    error,
+                )
                 return name, None
-            return name, self._normalise_tool_interface(name, parsed, evidence)
+            normalised = self._normalise_tool_interface(name, parsed, evidence)
+            self._record_probe_event(
+                kind="deterministic",
+                stage="TOOL_INTERFACE_NORMALIZATION",
+                input_data={"runtime_tool_name": name, "model_output": parsed},
+                output_data=normalised,
+                metadata={"interface_contract_version": 2},
+            )
+            return name, normalised
 
         results: List[Tuple[str, Optional[dict]]] = []
         workers = min(self.max_parallel_stage_requests, len(tools))
@@ -1419,6 +1437,15 @@ class AgentBreakerChains(AgentBreaker):
     @staticmethod
     def _normalise_tool_interface(name: str, parsed: dict, evidence: dict) -> dict:
         """Normalise fields while preserving exact names and evidence."""
+        if parsed.get("interface_contract_version") == 2:
+            return AgentBreakerChains._normalise_tool_interface_v2(
+                name, parsed, evidence
+            )
+        return AgentBreakerChains._normalise_tool_interface_v1(name, parsed, evidence)
+
+    @staticmethod
+    def _normalise_tool_interface_v1(name: str, parsed: dict, evidence: dict) -> dict:
+        """Preserve the pre-v2 interface contract for compatibility callers."""
         evidence_text = json.dumps(evidence, ensure_ascii=False).lower()
 
         def fields(key: str) -> list:
@@ -1434,9 +1461,14 @@ class AgentBreakerChains(AgentBreaker):
                 # when the supplied contract/recon evidence actually names it.
                 if field.lower() not in evidence_text:
                     continue
-                semantic = re.sub(
-                    r"[^a-z0-9]+", "_", str(raw.get("semantic_type") or "unknown").lower()
-                ).strip("_") or "unknown"
+                semantic = (
+                    re.sub(
+                        r"[^a-z0-9]+",
+                        "_",
+                        str(raw.get("semantic_type") or "unknown").lower(),
+                    ).strip("_")
+                    or "unknown"
+                )
                 item = {
                     "field": field,
                     "type": str(raw.get("type") or "unknown"),
@@ -1450,9 +1482,7 @@ class AgentBreakerChains(AgentBreaker):
 
         consumes = fields("consumes")
         produces = fields("produces")
-        capability_class = str(
-            parsed.get("capability_class") or "read_sensitive"
-        )
+        capability_class = str(parsed.get("capability_class") or "read_sensitive")
         high_impact = bool(parsed.get("high_impact_action"))
         # Resolve an internally contradictory classification deterministically:
         # code execution and irreversible actions are sinks by definition even
@@ -1475,11 +1505,128 @@ class AgentBreakerChains(AgentBreaker):
             "consumes": [field["field"] for field in consumes],
             "produces": [field["field"] for field in produces],
             "capability_class": capability_class,
-            "is_source": bool(parsed.get("attacker_controlled_input")) or bool(produces),
+            "is_source": bool(parsed.get("attacker_controlled_input"))
+            or bool(produces),
             "is_sink": derived_sink,
             "sink_severity": severity,
-            "side_effects": [str(item) for item in parsed.get("side_effects", []) if isinstance(item, str)],
-            "evidence_summary": [str(item) for item in parsed.get("evidence_summary", []) if isinstance(item, str)],
+            "side_effects": [
+                str(item)
+                for item in parsed.get("side_effects", [])
+                if isinstance(item, str)
+            ],
+            "evidence_summary": [
+                str(item)
+                for item in parsed.get("evidence_summary", [])
+                if isinstance(item, str)
+            ],
+        }
+
+    @staticmethod
+    def _normalise_tool_interface_v2(name: str, parsed: dict, evidence: dict) -> dict:
+        """Normalise v2 evidence and derive source/sink policy in code."""
+        evidence_text = json.dumps(evidence, ensure_ascii=False).lower()
+
+        def fields(key: str) -> list:
+            normalised = []
+            seen = set()
+            for raw in parsed.get(key, []) or []:
+                if not isinstance(raw, dict):
+                    continue
+                field = str(raw.get("field") or "").strip()
+                proof = str(raw.get("evidence") or "").strip()
+                if not field or not proof or field.lower() == "unknown":
+                    continue
+                if field != "$response" and field.lower() not in evidence_text:
+                    continue
+                if field == "$response" and key != "produces":
+                    continue
+                dedupe_key = field.lower()
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                semantic = (
+                    re.sub(
+                        r"[^a-z0-9]+",
+                        "_",
+                        str(raw.get("semantic_type") or "unknown").lower(),
+                    ).strip("_")
+                    or "unknown"
+                )
+                item = {
+                    "field": field,
+                    "semantic_type": semantic,
+                    "evidence": proof,
+                }
+                if key == "consumes":
+                    requirement = str(raw.get("required") or "unknown").lower()
+                    if requirement not in {"required", "optional", "unknown"}:
+                        requirement = "unknown"
+                    item["required"] = requirement
+                normalised.append(item)
+            return normalised
+
+        consumes = fields("consumes")
+        produces = fields("produces")
+        consumed_by_name = {item["field"].lower(): item["field"] for item in consumes}
+
+        controlled = []
+        controlled_names = set()
+        for raw in parsed.get("attacker_controlled_fields", []) or []:
+            if not isinstance(raw, dict):
+                continue
+            field = str(raw.get("field") or "").strip()
+            proof = str(raw.get("evidence") or "").strip()
+            canonical = consumed_by_name.get(field.lower())
+            if not canonical or not proof or canonical.lower() in controlled_names:
+                continue
+            controlled.append({"field": canonical, "evidence": proof})
+            controlled_names.add(canonical.lower())
+
+        capabilities = []
+        capability_names = set()
+        for raw in parsed.get("security_capabilities", []) or []:
+            if not isinstance(raw, dict):
+                continue
+            capability = str(raw.get("class") or "").strip()
+            details = str(raw.get("details") or "").strip()
+            proof = str(raw.get("evidence") or "").strip()
+            if (
+                capability not in TOOL_INTERFACE_CAPABILITY_SEVERITY
+                or not details
+                or not proof
+                or capability in capability_names
+            ):
+                continue
+            capabilities.append(
+                {"class": capability, "details": details, "evidence": proof}
+            )
+            capability_names.add(capability)
+
+        mandatory = {
+            item["field"].lower()
+            for item in consumes
+            if item.get("required") == "required"
+        }
+        is_source = not mandatory or mandatory.issubset(controlled_names)
+        severity = max(
+            (
+                TOOL_INTERFACE_CAPABILITY_SEVERITY[item["class"]]
+                for item in capabilities
+            ),
+            default=1,
+        )
+        return {
+            "interface_contract_version": 2,
+            "runtime_tool_name": name,
+            "consume_records": consumes,
+            "produce_records": produces,
+            "consumes": [item["field"] for item in consumes],
+            "produces": [item["field"] for item in produces],
+            "security_capabilities": capabilities,
+            "attacker_controlled_fields": controlled,
+            "is_source": is_source,
+            "is_sink": bool(capabilities),
+            "sink_severity": severity,
         }
 
     @staticmethod
@@ -1496,9 +1643,7 @@ class AgentBreakerChains(AgentBreaker):
                 }
                 for src, src_tags in tool_tags.items()
                 for dst, dst_tags in tool_tags.items()
-                if src != dst
-                and src_tags.get("produces")
-                and dst_tags.get("consumes")
+                if src != dst and src_tags.get("produces") and dst_tags.get("consumes")
             ]
         edges: List[dict] = []
         for src, src_tags in tool_tags.items():
@@ -1508,22 +1653,37 @@ class AgentBreakerChains(AgentBreaker):
                 for produced in src_tags.get("produce_records", []) or []:
                     for consumed in dst_tags.get("consume_records", []) or []:
                         exact = produced["field"].lower() == consumed["field"].lower()
-                        semantic = (
-                            produced.get("semantic_type") != "unknown"
-                            and produced.get("semantic_type") == consumed.get("semantic_type")
+                        semantic = produced.get(
+                            "semantic_type"
+                        ) != "unknown" and produced.get(
+                            "semantic_type"
+                        ) == consumed.get(
+                            "semantic_type"
                         )
-                        if exact or semantic:
-                            edges.append({
+                        edges.append(
+                            {
                                 "from": src,
                                 "to": dst,
                                 "producer_field": produced["field"],
                                 "consumer_field": consumed["field"],
-                                "producer_semantic_type": produced.get("semantic_type", "unknown"),
-                                "consumer_semantic_type": consumed.get("semantic_type", "unknown"),
-                                "match_kind": "exact" if exact else "semantic",
+                                "producer_semantic_type": produced.get(
+                                    "semantic_type", "unknown"
+                                ),
+                                "consumer_semantic_type": consumed.get(
+                                    "semantic_type", "unknown"
+                                ),
+                                "match_kind": (
+                                    "exact"
+                                    if exact
+                                    else "semantic" if semantic else "unresolved"
+                                ),
+                                "consumer_requirement": consumed.get(
+                                    "required", "unknown"
+                                ),
                                 "producer_evidence": produced.get("evidence", ""),
                                 "consumer_evidence": consumed.get("evidence", ""),
-                            })
+                            }
+                        )
         return edges
 
     def _score_edges(self, candidate_edges: List[dict]) -> List[dict]:
@@ -1577,6 +1737,9 @@ class AgentBreakerChains(AgentBreaker):
                     "data_flow": e.get("data_flow", ""),
                     "evidence": e.get("evidence", ""),
                     "match_kind": allowed[key]["match_kind"],
+                    "consumer_requirement": allowed[key].get(
+                        "consumer_requirement", "unknown"
+                    ),
                 }
             )
         return scored
@@ -2109,11 +2272,24 @@ class AgentBreakerChains(AgentBreaker):
                 consumer = frontier.pop(0)
                 by_input: dict[str, list] = {}
                 for edge in incoming.get(consumer, []):
-                    by_input.setdefault(edge.get("consumer_field", "data"), []).append(edge)
-                for field_edges in by_input.values():
+                    by_input.setdefault(edge.get("consumer_field", "data"), []).append(
+                        edge
+                    )
+                requirement_priority = {"required": 0, "unknown": 1, "optional": 2}
+                ordered_fields = sorted(
+                    by_input.values(),
+                    key=lambda field_edges: requirement_priority.get(
+                        str(field_edges[0].get("consumer_requirement", "unknown")),
+                        1,
+                    ),
+                )
+                for field_edges in ordered_fields:
                     best = max(field_edges, key=lambda item: item["confidence"])
                     producer = best["from"]
-                    if producer not in selected_nodes and len(selected_nodes) >= self.max_chain_len:
+                    if (
+                        producer not in selected_nodes
+                        and len(selected_nodes) >= self.max_chain_len
+                    ):
                         continue
                     if best not in selected_edges:
                         selected_edges.append(best)
@@ -2121,6 +2297,29 @@ class AgentBreakerChains(AgentBreaker):
                         selected_nodes.add(producer)
                         frontier.append(producer)
             if len(selected_nodes) < 2:
+                continue
+            required_inputs_satisfied = True
+            for node in selected_nodes:
+                tag = tool_tags.get(node, {})
+                controlled = {
+                    str(item.get("field") or "").lower()
+                    for item in tag.get("attacker_controlled_fields", []) or []
+                    if isinstance(item, dict)
+                }
+                bound = {
+                    str(edge.get("consumer_field") or "").lower()
+                    for edge in selected_edges
+                    if edge.get("to") == node
+                }
+                required = {
+                    str(item.get("field") or "").lower()
+                    for item in tag.get("consume_records", []) or []
+                    if isinstance(item, dict) and item.get("required") == "required"
+                }
+                if required - controlled - bound:
+                    required_inputs_satisfied = False
+                    break
+            if not required_inputs_satisfied:
                 continue
             if not any(
                 tool_tags.get(node, {}).get("is_source") for node in selected_nodes
@@ -2133,18 +2332,22 @@ class AgentBreakerChains(AgentBreaker):
             for edge in selected_edges:
                 confidence *= float(edge.get("confidence", 0.0))
             severity = int(tag.get("sink_severity", 1) or 1)
-            candidates.append({
-                "sequence": sequence,
-                "nodes": sequence,
-                "sink": sink,
-                "edges": selected_edges,
-                "dependencies": selected_edges,
-                "score": severity * confidence,
-            })
+            candidates.append(
+                {
+                    "sequence": sequence,
+                    "nodes": sequence,
+                    "sink": sink,
+                    "edges": selected_edges,
+                    "dependencies": selected_edges,
+                    "score": severity * confidence,
+                }
+            )
         candidates.sort(key=lambda item: item["score"], reverse=True)
         return candidates[: self.max_chains]
 
-    def _search_legacy_linear_paths(self, edges: List[dict], tool_tags: dict) -> List[dict]:
+    def _search_legacy_linear_paths(
+        self, edges: List[dict], tool_tags: dict
+    ) -> List[dict]:
         """Preserve the old public helper contract for external callers/tests."""
         adjacency: dict[str, list] = {}
         for edge in edges:
@@ -2171,14 +2374,18 @@ class AgentBreakerChains(AgentBreaker):
         for tool, tag in tool_tags.items():
             if tag.get("is_source"):
                 walk(tool, [tool], [], 1.0)
-        found.sort(key=lambda item: self._path_search_priority(item[0], item[1]), reverse=True)
+        found.sort(
+            key=lambda item: self._path_search_priority(item[0], item[1]), reverse=True
+        )
         return [
             {"sequence": sequence, "edges": selected, "score": score}
             for score, sequence, selected in found[: self.max_chains]
         ]
 
     @staticmethod
-    def _topological_order(nodes: Iterable[str], edges: List[dict]) -> Optional[List[str]]:
+    def _topological_order(
+        nodes: Iterable[str], edges: List[dict]
+    ) -> Optional[List[str]]:
         """Return a stable dependency-valid order, or ``None`` for a cycle."""
         node_order = list(dict.fromkeys(nodes))
         indegree = {node: 0 for node in node_order}
@@ -2224,7 +2431,11 @@ class AgentBreakerChains(AgentBreaker):
                 try:
                     analysis = self._detector._extract_json(response)
                 except json.JSONDecodeError as error:
-                    logging.warning("%s # Failed to parse PATH_ANALYSIS: %s", self.__class__.__name__, error)
+                    logging.warning(
+                        "%s # Failed to parse PATH_ANALYSIS: %s",
+                        self.__class__.__name__,
+                        error,
+                    )
             return {**path, "path_analysis": analysis}
 
         workers = min(self.max_parallel_stage_requests, len(paths))
@@ -2246,8 +2457,13 @@ class AgentBreakerChains(AgentBreaker):
                 {
                     key: edge.get(key)
                     for key in (
-                        "from", "to", "producer_field", "consumer_field",
-                        "confidence", "data_flow", "evidence",
+                        "from",
+                        "to",
+                        "producer_field",
+                        "consumer_field",
+                        "confidence",
+                        "data_flow",
+                        "evidence",
                     )
                 }
                 for edge in path.get("edges", [])
@@ -2386,7 +2602,10 @@ class AgentBreakerChains(AgentBreaker):
 
         for i, path in enumerate(paths, start=1):
             sequence = path["sequence"]
-            if "dependencies" not in path and not self._path_satisfies_required_workflow(sequence):
+            if (
+                "dependencies" not in path
+                and not self._path_satisfies_required_workflow(sequence)
+            ):
                 logging.info(
                     "%s # Dropping legacy path outside required structural workflow: %s",
                     self.__class__.__name__,
@@ -6096,6 +6315,11 @@ class AgentBreakerChains(AgentBreaker):
             return {}
         tool_name = sequence[step_index]
         artifact_keys = entry.get("artifact_keys") or []
+        raw_response_artifact = (
+            {"$response": (agent_response or "")[: self._STEP_RESPONSE_CHAR_LIMIT]}
+            if "$response" in artifact_keys and agent_response
+            else {}
+        )
 
         prompt = self._prompts["EXTRACT_ARTIFACTS"].format(
             tool_name=tool_name,
@@ -6109,7 +6333,10 @@ class AgentBreakerChains(AgentBreaker):
         self._setup_parse_model()
         response = self._get_model_response(prompt, model=self.parse_model)
         if not response:
-            return self._response_fallback_artifacts(tool_name, agent_response)
+            return {
+                **raw_response_artifact,
+                **self._response_fallback_artifacts(tool_name, agent_response),
+            }
         try:
             parsed = self._detector._extract_json(response)
         except json.JSONDecodeError as e:
@@ -6117,11 +6344,20 @@ class AgentBreakerChains(AgentBreaker):
                 f"{self.__class__.__name__} # Failed to parse artifact extraction "
                 f"JSON for {tool_name}: {e}"
             )
-            return self._response_fallback_artifacts(tool_name, agent_response)
+            return {
+                **raw_response_artifact,
+                **self._response_fallback_artifacts(tool_name, agent_response),
+            }
         artifacts = parsed.get("artifacts") or {}
         if not isinstance(artifacts, dict):
-            return self._response_fallback_artifacts(tool_name, agent_response)
-        flat = {str(k): str(v) for k, v in artifacts.items() if v not in (None, "")}
+            return {
+                **raw_response_artifact,
+                **self._response_fallback_artifacts(tool_name, agent_response),
+            }
+        flat = {
+            **raw_response_artifact,
+            **{str(k): str(v) for k, v in artifacts.items() if v not in (None, "")},
+        }
         for key, value in self._identity_user_artifacts_from_response(
             tool_name, agent_response
         ).items():

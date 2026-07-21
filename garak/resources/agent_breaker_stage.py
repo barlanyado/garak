@@ -31,6 +31,20 @@ STAGE_TEMPLATE_SOURCES = {
     "STEP_EXPLOIT": "garak/data/agent_breaker_chains/prompts.yaml",
 }
 
+TOOL_INTERFACE_CAPABILITY_SEVERITY = {
+    "read_sensitive": 3,
+    "write_mutate": 3,
+    "network_egress": 4,
+    "code_exec": 5,
+    "auth_identity": 5,
+    "financial_transaction": 5,
+    "physical_action": 5,
+    "irreversible": 5,
+    "other_security_impact": 3,
+}
+
+TOOL_INTERFACE_REQUIREMENTS = frozenset({"required", "optional", "unknown"})
+
 _REQUEST_METADATA_KEYS = frozenset(
     {
         "provider",
@@ -175,39 +189,101 @@ def validate_stage_output(stage: str, parsed: object) -> list[str]:
 
     if stage == "TOOL_INTERFACE_TAGGING":
         item = root
+        if item.get("interface_contract_version") != 2:
+            errors.append("$.interface_contract_version must be 2")
         for key in ("consumes", "produces"):
             fields = _require_list(item.get(key), f"$.{key}", errors)
             for index, field in enumerate(fields):
                 record = _require_mapping(field, f"$.{key}[{index}]", errors)
-                for field_key in ("field", "type", "semantic_type", "evidence"):
-                    if not isinstance(record.get(field_key), str):
-                        errors.append(f"$.{key}[{index}].{field_key} must be a string")
-                if key == "consumes" and not isinstance(record.get("required"), bool):
-                    errors.append(f"$.{key}[{index}].required must be boolean")
-        _require_string_list(item.get("side_effects"), "$.side_effects", errors)
-        _require_string_list(item.get("evidence_summary"), "$.evidence_summary", errors)
-        if item.get("capability_class") not in {
-                "read_sensitive",
-                "write_mutate",
-                "network_egress",
-                "code_exec",
-                "auth_identity",
-                "irreversible",
-            }:
-                errors.append("$.capability_class has an invalid value")
-        for key in ("attacker_controlled_input", "high_impact_action"):
-            if not isinstance(item.get(key), bool):
-                errors.append(f"$.{key} must be boolean")
-        severity = item.get("impact_severity")
-        if isinstance(severity, bool) or not isinstance(severity, int):
-            errors.append("$.impact_severity must be an integer")
-        elif not 1 <= severity <= 5:
-            errors.append("$.impact_severity must be 1-5")
+                for field_key in ("field", "semantic_type", "evidence"):
+                    value = record.get(field_key)
+                    if not isinstance(value, str) or not value.strip():
+                        errors.append(
+                            f"$.{key}[{index}].{field_key} must be a non-empty string"
+                        )
+                field_name = record.get("field")
+                if isinstance(field_name, str):
+                    if field_name == "$response" and key != "produces":
+                        errors.append("$response is allowed only in $.produces")
+                    elif field_name.strip().lower() == "unknown":
+                        errors.append(
+                            f"$.{key}[{index}].field must be an exact field name"
+                        )
+                if (
+                    key == "consumes"
+                    and record.get("required") not in TOOL_INTERFACE_REQUIREMENTS
+                ):
+                    errors.append(
+                        f"$.{key}[{index}].required must be required, optional, or unknown"
+                    )
+
+        capabilities = _require_list(
+            item.get("security_capabilities"), "$.security_capabilities", errors
+        )
+        for index, capability in enumerate(capabilities):
+            record = _require_mapping(
+                capability, f"$.security_capabilities[{index}]", errors
+            )
+            capability_class = record.get("class")
+            if capability_class not in TOOL_INTERFACE_CAPABILITY_SEVERITY:
+                errors.append(
+                    f"$.security_capabilities[{index}].class has an invalid value"
+                )
+            for key in ("details", "evidence"):
+                value = record.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(
+                        f"$.security_capabilities[{index}].{key} must be a non-empty string"
+                    )
+
+        controlled = _require_list(
+            item.get("attacker_controlled_fields"),
+            "$.attacker_controlled_fields",
+            errors,
+        )
+        consumed_names = {
+            record.get("field")
+            for record in item.get("consumes", [])
+            if isinstance(record, dict) and isinstance(record.get("field"), str)
+        }
+        for index, controlled_field in enumerate(controlled):
+            record = _require_mapping(
+                controlled_field, f"$.attacker_controlled_fields[{index}]", errors
+            )
+            for key in ("field", "evidence"):
+                value = record.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(
+                        f"$.attacker_controlled_fields[{index}].{key} must be a non-empty string"
+                    )
+            if record.get("field") not in consumed_names:
+                errors.append(
+                    f"$.attacker_controlled_fields[{index}].field must name a consumed field"
+                )
+
+        for forbidden in (
+            "capability_class",
+            "attacker_controlled_input",
+            "high_impact_action",
+            "impact_severity",
+            "is_source",
+            "is_sink",
+            "sink_severity",
+        ):
+            if forbidden in item:
+                errors.append(f"$.{forbidden} is not part of interface contract v2")
     elif stage == "EDGE_SCORE":
         edges = _require_list(root.get("edges"), "$.edges", errors)
         for index, edge in enumerate(edges):
             item = _require_mapping(edge, f"$.edges[{index}]", errors)
-            for key in ("from", "to", "producer_field", "consumer_field", "data_flow", "evidence"):
+            for key in (
+                "from",
+                "to",
+                "producer_field",
+                "consumer_field",
+                "data_flow",
+                "evidence",
+            ):
                 if not isinstance(item.get(key), str) or not item.get(key).strip():
                     errors.append(f"$.edges[{index}].{key} must be a non-empty string")
             confidence = item.get("confidence")

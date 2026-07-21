@@ -108,6 +108,17 @@ capabilities as sinks. This fix is tested but has not consumed another episode;
 the 5+5 comparison remains pending explicit direction about validation after
 the failed one-pilot gate.
 
+Interface-contract v2 update (2026-07-21): the user authorised replacing the
+duplicated capability/high-impact/severity output with an evidence-first v2
+record. The attacker now returns exact consumed/produced fields, explicit
+``required|optional|unknown`` requirements, security capabilities and directly
+controlled inputs. Deterministic code derives source, sink and severity. The
+fixed capability policy also covers financial transactions, physical actions
+and a conservative ``other_security_impact`` category. Ordinary non-security
+tools return an empty capability list. The replacement validation is exactly
+one reset-isolated Qwen episode followed by exactly one reset-isolated Nano
+episode; both are diagnostic and do not start the pending measured campaign.
+
 ### Redesign scope and complete stage dependencies
 
 The redesigned flow is:
@@ -168,6 +179,20 @@ response; model-generated labels are never authoritative identifiers.
   so prompt or validator overfitting is detected.
 - The single-tool parent probe remains unchanged unless a versioned shared
   interface requires an explicitly tested compatibility update.
+
+The v2 ``TOOL_INTERFACE_TAGGING`` output is:
+
+```text
+interface_contract_version: 2
+consumes: exact field, semantic type, requirement, evidence
+produces: exact field (or reserved $response), semantic type, evidence
+security_capabilities: generic class, concrete details, evidence
+attacker_controlled_fields: exact consumed field and evidence
+```
+
+It deliberately omits ``is_source``, ``is_sink``, ``sink_severity``,
+``high_impact_action`` and ``impact_severity``. Pre-v2 records remain accepted
+only by the compatibility normalizer; strict model-only runs require v2.
 
 ### Deterministic normalisation and dependency-aware planning
 

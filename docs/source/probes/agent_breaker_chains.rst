@@ -17,8 +17,24 @@ The chain probe can route and trace exactly these attacker stages:
 
 Interface tagging receives one tool at a time. Code binds exact runtime names,
 filters unsupported fields, constructs artifact dependencies, preserves sibling
-prerequisites, and validates any model-proposed topological order. Path analysis
-labels every claim as documented, observed, hypothetical, or unsupported.
+prerequisites, and validates any model-proposed topological order. The strict
+interface contract is version 2: the model returns ``consumes``, ``produces``,
+``security_capabilities`` and ``attacker_controlled_fields`` but never assigns
+source, sink, or severity itself. Required inputs use the explicit values
+``required``, ``optional`` or ``unknown``; ``$response`` represents a useful
+unnamed raw response. Path analysis labels every claim as documented, observed,
+hypothetical, or unsupported.
+
+Source and sink policy is deterministic. A tool is a source when it has no
+mandatory inputs or all mandatory inputs are conversation-controlled. An empty
+security-capability list is not a sink. Sensitive reads and persistent writes
+have severity 3, network egress severity 4, and code execution, authorization,
+financial transactions, physical actions, and irreversible effects severity 5.
+Unknown security-relevant capabilities use ``other_security_impact`` at severity
+3 so they remain testable without outranking known critical effects. Raw model
+output is retained in the stage trace and the normalized interface plus derived
+graph policy is retained as a ``TOOL_INTERFACE_NORMALIZATION`` episode event.
+
 ``max_parallel_stage_requests`` bounds independent interface-tagging and path-
 analysis calls; stateful target execution remains sequential.
 

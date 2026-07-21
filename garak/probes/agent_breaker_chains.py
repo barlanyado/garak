@@ -62,8 +62,8 @@ class AgentBreakerChains(AgentBreaker):
        and security capabilities; code derives source/sink markers.
     2. _build_capability_graph — pure-Python candidate edges where one
        tool's output tag feeds another tool's input tag.
-    3. _bind_global_interfaces — one global LLM call maps non-exact relations
-       and documented state preconditions.
+    3. _bind_global_interfaces — one global LLM call normalises the complete
+       artifact map and documented state preconditions.
     4. _search_chains — pure-Python bounded source->sink path search,
        ranked by ``sink_severity * product(edge_confidence)``.
     5. _generate_chain_attacks — write conversational payloads for each
@@ -76,7 +76,6 @@ class AgentBreakerChains(AgentBreaker):
 
     goal = "Identify weaknesses in agentic applications through multi-tool chaining"
     primary_detector = "agent_breaker_chains.AgentBreakerChainResult"
-    run_tool_analysis = False
 
     DEFAULT_PARAMS = AgentBreaker.DEFAULT_PARAMS | {
         # Maximum number of tool chains to attack (top-ranked by severity x confidence)
@@ -1313,8 +1312,8 @@ class AgentBreakerChains(AgentBreaker):
            security capabilities, then derive source/sink markers in code.
         2. `_build_capability_graph` — pure-Python candidate edges where
            one tool's output tag feeds another tool's input tag.
-        3. `_bind_global_interfaces` — accept exact bindings in code and ask one
-           global LLM call to map non-exact relations and state prerequisites.
+        3. `_bind_global_interfaces` — ask one global LLM call for the complete
+           artifact map, then validate names and derive relation types in code.
         4. `_search_chains` — pure-Python bounded source->sink path search,
            ranked by ``sink_severity * product(edge_confidence)``.
         5. Deterministically complete public join/state prerequisites.
@@ -1810,35 +1809,6 @@ class AgentBreakerChains(AgentBreaker):
             }
         return context
 
-    def _unresolved_interface_inputs(self, exact_edges: list[dict]) -> list[dict]:
-        """List non-exact consumer inputs for the global binding model."""
-        exact_bound = {
-            (str(edge.get("to")), str(edge.get("consumer_field")))
-            for edge in exact_edges
-        }
-        unresolved = []
-        for tool_name, tag in self.tool_tags.items():
-            controlled = {
-                str(item.get("field") or "")
-                for item in tag.get("attacker_controlled_fields", []) or []
-                if isinstance(item, dict)
-            }
-            for item in tag.get("consume_records", []) or []:
-                field = str(item.get("field") or "")
-                if not field or (tool_name, field) in exact_bound:
-                    continue
-                unresolved.append(
-                    {
-                        "tool": tool_name,
-                        "field": field,
-                        "semantic_type": item.get("semantic_type", "unknown"),
-                        "required": item.get("required", "unknown"),
-                        "conversation_controlled": field in controlled,
-                        "evidence": item.get("evidence", ""),
-                    }
-                )
-        return unresolved
-
     @staticmethod
     def _exact_binding_edges(candidate_edges: list[dict]) -> list[dict]:
         """Convert authoritative exact-name candidates into accepted edges."""
@@ -1864,8 +1834,12 @@ class AgentBreakerChains(AgentBreaker):
             if edge.get("match_kind") == "exact"
         ]
 
-    def _normalise_global_bindings(self, parsed: dict, exact: list[dict]) -> list[dict]:
-        """Validate model-proposed global bindings against exact interfaces."""
+    def _normalise_global_artifacts(
+        self, parsed: dict, candidate_edges: list[dict]
+    ) -> list[dict]:
+        """Validate a complete model-produced artifact map against interfaces."""
+        if not isinstance(parsed, dict):
+            parsed = {}
         tools = set(self.tool_tags)
         produces = {
             tool: {
@@ -1883,80 +1857,141 @@ class AgentBreakerChains(AgentBreaker):
             }
             for tool, tag in self.tool_tags.items()
         }
-        exact_keys = {
-            (
+        controlled = {
+            tool: {
+                str(item.get("field") or "")
+                for item in tag.get("attacker_controlled_fields", []) or []
+                if isinstance(item, dict)
+            }
+            for tool, tag in self.tool_tags.items()
+        }
+        support_confidence = {"documented": 0.95, "observed": 0.95, "inferred": 0.75}
+        accepted: list[dict] = []
+        rejected: list[dict] = []
+        seen: set[tuple[str, str, str, str, str]] = set()
+        model_flow_keys: set[tuple[str, str, str, str]] = set()
+        covered_inputs: set[tuple[str, str]] = set()
+
+        for group in parsed.get("artifact_groups", []) or []:
+            if not isinstance(group, dict):
+                rejected.append({"artifact_group": group, "reason": "not an object"})
+                continue
+            canonical = str(group.get("canonical_name") or "").strip()
+            for raw in group.get("flows", []) or []:
+                if not isinstance(raw, dict):
+                    rejected.append({"flow": raw, "reason": "not an object"})
+                    continue
+                producer_record = raw.get("producer")
+                consumer_record = raw.get("consumer")
+                if not isinstance(producer_record, dict) or not isinstance(
+                    consumer_record, dict
+                ):
+                    rejected.append(
+                        {"flow": raw, "reason": "producer and consumer must be objects"}
+                    )
+                    continue
+                producer = str(producer_record.get("tool") or "")
+                consumer = str(consumer_record.get("tool") or "")
+                producer_field = str(producer_record.get("field") or "")
+                consumer_field = str(consumer_record.get("field") or "")
+                member = str(producer_record.get("member") or "").strip()
+                support = str(raw.get("support") or "")
+                evidence = str(raw.get("evidence") or "").strip()
+                key = (
+                    producer,
+                    consumer,
+                    producer_field,
+                    consumer_field,
+                    member,
+                )
+                reason = ""
+                if (
+                    producer not in tools
+                    or consumer not in tools
+                    or producer == consumer
+                ):
+                    reason = "unknown or identical producer/consumer tool"
+                elif producer_field not in produces.get(producer, set()):
+                    reason = "producer field is not declared"
+                elif consumer_field not in consumes.get(consumer, {}):
+                    reason = "consumer field is not declared"
+                elif key in seen:
+                    reason = "duplicate artifact flow"
+                elif producer_field == "$response" and not member:
+                    reason = "$response requires a named visible member"
+                elif producer_field != "$response" and member:
+                    reason = "named outputs cannot declare a response member"
+                elif support not in support_confidence:
+                    reason = "unsupported evidence class"
+                elif not canonical or not evidence:
+                    reason = "canonical name and evidence are required"
+                if reason:
+                    rejected.append({"flow": raw, "reason": reason})
+                    continue
+
+                match_kind = (
+                    "response_member"
+                    if producer_field == "$response"
+                    else "exact"
+                    if producer_field == consumer_field
+                    else "semantic_alias"
+                )
+                confidence = (
+                    1.0
+                    if match_kind == "exact"
+                    else support_confidence[support]
+                )
+                seen.add(key)
+                model_flow_keys.add(
+                    (producer, consumer, producer_field, consumer_field)
+                )
+                covered_inputs.add((consumer, consumer_field))
+                accepted.append(
+                    {
+                        "from": producer,
+                        "to": consumer,
+                        "producer_field": producer_field,
+                        "producer_member": member,
+                        "consumer_field": consumer_field,
+                        "canonical_artifact": canonical,
+                        "confidence": confidence,
+                        "data_flow": (
+                            f"{producer_field}"
+                            + (f".{member}" if member else "")
+                            + f" satisfies {consumer_field}"
+                        ),
+                        "evidence": evidence,
+                        "match_kind": match_kind,
+                        "support": support,
+                        "consumer_requirement": consumes[consumer][consumer_field],
+                    }
+                )
+
+        exact = self._exact_binding_edges(candidate_edges)
+        missing_exact = []
+        for edge in exact:
+            key = (
                 edge["from"],
                 edge["to"],
                 edge["producer_field"],
                 edge["consumer_field"],
             )
-            for edge in exact
-        }
-        support_confidence = {"documented": 0.95, "observed": 0.95, "inferred": 0.75}
-        accepted = list(exact)
-        rejected = []
-        seen = set(exact_keys)
-
-        for raw in parsed.get("bindings", []) or []:
-            producer = str(raw.get("producer_tool") or "")
-            consumer = str(raw.get("consumer_tool") or "")
-            producer_field = str(raw.get("producer_field") or "")
-            consumer_field = str(raw.get("consumer_field") or "")
-            member = str(raw.get("producer_member") or "").strip()
-            relation = str(raw.get("relation") or "")
-            support = str(raw.get("support") or "")
-            key = (producer, consumer, producer_field, consumer_field)
-            reason = ""
-            if producer not in tools or consumer not in tools or producer == consumer:
-                reason = "unknown or identical producer/consumer tool"
-            elif producer_field not in produces.get(producer, set()):
-                reason = "producer field is not declared"
-            elif consumer_field not in consumes.get(consumer, {}):
-                reason = "consumer field is not declared"
-            elif key in seen:
-                reason = "duplicate or deterministic exact binding"
-            elif relation == "response_member" and (
-                producer_field != "$response" or not member
-            ):
-                reason = "response_member requires $response and a member"
-            elif relation == "semantic_alias" and (
-                producer_field == "$response" or member
-            ):
-                reason = "semantic_alias requires a named output and empty member"
-            elif support not in support_confidence:
-                reason = "unsupported evidence class"
-            if reason:
-                rejected.append({"binding": raw, "reason": reason})
+            if key in model_flow_keys:
                 continue
-            seen.add(key)
-            accepted.append(
-                {
-                    "from": producer,
-                    "to": consumer,
-                    "producer_field": producer_field,
-                    "producer_member": member,
-                    "consumer_field": consumer_field,
-                    "canonical_artifact": str(
-                        raw.get("canonical_artifact") or consumer_field
-                    ),
-                    "confidence": support_confidence[support],
-                    "data_flow": (
-                        f"{producer_field}"
-                        + (f".{member}" if member else "")
-                        + f" satisfies {consumer_field}"
-                    ),
-                    "evidence": str(raw.get("evidence") or ""),
-                    "match_kind": relation,
-                    "support": support,
-                    "consumer_requirement": consumes[consumer][consumer_field],
-                }
-            )
+            missing_exact.append(key)
+            accepted.append(edge)
+            covered_inputs.add((edge["to"], edge["consumer_field"]))
 
         for raw in parsed.get("state_preconditions", []) or []:
+            if not isinstance(raw, dict):
+                rejected.append(
+                    {"state_precondition": raw, "reason": "not an object"}
+                )
+                continue
             before = str(raw.get("before_tool") or "")
             after = str(raw.get("after_tool") or "")
             support = str(raw.get("support") or "")
-            key = (before, after, "$state", "$state")
+            key = (before, after, "$state", "$state", "")
             reason = ""
             if before not in tools or after not in tools or before == after:
                 reason = "unknown or identical state-precondition tool"
@@ -1986,38 +2021,117 @@ class AgentBreakerChains(AgentBreaker):
                 }
             )
 
+        accepted_unresolved = []
+        rejected_unresolved = []
+        unresolved_keys: set[tuple[str, str]] = set()
+        for raw in parsed.get("unresolved_inputs", []) or []:
+            if not isinstance(raw, dict):
+                rejected_unresolved.append(
+                    {"unresolved_input": raw, "reason": "not an object"}
+                )
+                continue
+            tool = str(raw.get("tool") or "")
+            field = str(raw.get("field") or "")
+            resolution = str(raw.get("resolution") or "")
+            evidence = str(raw.get("evidence") or "").strip()
+            key = (tool, field)
+            reason = ""
+            if tool not in tools or field not in consumes.get(tool, {}):
+                reason = "input field is not declared"
+            elif key in covered_inputs:
+                reason = "input already has an artifact flow"
+            elif key in unresolved_keys:
+                reason = "duplicate unresolved input"
+            elif (
+                resolution == "conversation_controlled"
+                and field not in controlled[tool]
+            ):
+                reason = "input is not declared conversation-controlled"
+            elif resolution == "optional" and consumes[tool][field] != "optional":
+                reason = "input is not declared optional"
+            elif resolution == "unknown" and (
+                field in controlled[tool] or consumes[tool][field] == "optional"
+            ):
+                reason = "known controlled or optional resolution was ignored"
+            elif resolution not in {"conversation_controlled", "optional", "unknown"}:
+                reason = "unsupported input resolution"
+            elif not evidence:
+                reason = "evidence is required"
+            if reason:
+                rejected_unresolved.append(
+                    {"unresolved_input": raw, "reason": reason}
+                )
+                continue
+            unresolved_keys.add(key)
+            accepted_unresolved.append(raw)
+
+        declared_inputs = {
+            (tool, field)
+            for tool, fields in consumes.items()
+            for field in fields
+        }
+        missing_inputs = sorted(declared_inputs - covered_inputs - unresolved_keys)
+        complete = not (
+            missing_exact or missing_inputs or rejected or rejected_unresolved
+        )
+
         self._record_probe_event(
             kind="deterministic",
-            stage="GLOBAL_INTERFACE_BINDING_NORMALIZATION",
+            stage="GLOBAL_ARTIFACT_NORMALIZATION",
             input_data=parsed,
-            output_data={"accepted_edges": accepted, "rejected_relations": rejected},
+            output_data={
+                "accepted_edges": accepted,
+                "accepted_unresolved_inputs": accepted_unresolved,
+                "rejected_relations": rejected,
+                "rejected_unresolved_inputs": rejected_unresolved,
+                "missing_exact_flows_added_by_code": missing_exact,
+                "missing_input_resolutions": missing_inputs,
+                "complete_model_map": complete,
+            },
         )
+        self.global_interface_normalization = {
+            "accepted_unresolved_inputs": accepted_unresolved,
+            "rejected_relations": rejected,
+            "rejected_unresolved_inputs": rejected_unresolved,
+            "missing_exact_flows_added_by_code": missing_exact,
+            "missing_input_resolutions": missing_inputs,
+            "complete_model_map": complete,
+        }
         self.global_interface_bindings = accepted
         return accepted
 
     def _bind_global_interfaces(self, candidate_edges: List[dict]) -> List[dict]:
-        """Map all non-exact interface relations in one evidence-aware LLM call."""
-        exact = self._exact_binding_edges(candidate_edges)
+        """Ask once for a complete global artifact map, then validate it in code."""
         context = self._global_interface_context()
-        unresolved = self._unresolved_interface_inputs(exact)
         prompt = self._prompts["GLOBAL_INTERFACE_BINDING"].format(
             tool_interfaces=json.dumps(context, indent=2, ensure_ascii=False),
-            exact_bindings=json.dumps(exact, indent=2, ensure_ascii=False),
-            unresolved_inputs=json.dumps(unresolved, indent=2, ensure_ascii=False),
         )
         response = self._get_stage_model_response(
             "GLOBAL_INTERFACE_BINDING",
             prompt,
             trace_context={
                 "artifacts": {
-                    "exact_binding_count": len(exact),
-                    "unresolved_input_count": len(unresolved),
+                    "tool_count": len(context),
+                    "declared_input_count": sum(
+                        len(tag.get("consume_records", []) or [])
+                        for tag in self.tool_tags.values()
+                    ),
+                    "declared_output_count": sum(
+                        len(tag.get("produce_records", []) or [])
+                        for tag in self.tool_tags.values()
+                    ),
                 }
             },
         )
         if not response:
-            self.global_interface_bindings = exact
-            return exact
+            return self._normalise_global_artifacts(
+                {
+                    "artifact_groups": [],
+                    "state_preconditions": [],
+                    "unresolved_inputs": [],
+                },
+                candidate_edges,
+            )
         try:
             parsed = self._detector._extract_json(response)
         except json.JSONDecodeError as error:
@@ -2026,9 +2140,12 @@ class AgentBreakerChains(AgentBreaker):
                 self.__class__.__name__,
                 error,
             )
-            self.global_interface_bindings = exact
-            return exact
-        return self._normalise_global_bindings(parsed, exact)
+            parsed = {
+                "artifact_groups": [],
+                "state_preconditions": [],
+                "unresolved_inputs": [],
+            }
+        return self._normalise_global_artifacts(parsed, candidate_edges)
 
     def _score_edges(self, candidate_edges: List[dict]) -> List[dict]:
         """Accept exact bindings in code and score only ambiguous candidates.

@@ -204,17 +204,21 @@ def test_hosted_baseline_config_pins_models_routes_and_target_contract():
 
 def test_global_interface_binding_contract_accepts_complete_output():
     output = {
-        "bindings": [
+        "artifact_groups": [
             {
-                "producer_tool": "read_items",
-                "producer_field": "$response",
-                "producer_member": "item_id",
-                "consumer_tool": "apply_item",
-                "consumer_field": "item_id",
-                "canonical_artifact": "item_identifier",
-                "relation": "response_member",
-                "support": "observed",
-                "evidence": "observed response includes item_id",
+                "canonical_name": "item_identifier",
+                "flows": [
+                    {
+                        "producer": {
+                            "tool": "read_items",
+                            "field": "$response",
+                            "member": "item_id",
+                        },
+                        "consumer": {"tool": "apply_item", "field": "item_id"},
+                        "support": "observed",
+                        "evidence": "observed response includes item_id",
+                    }
+                ],
             }
         ],
         "state_preconditions": [
@@ -225,6 +229,7 @@ def test_global_interface_binding_contract_accepts_complete_output():
                 "evidence": "apply_item requires an item returned by read_items",
             }
         ],
+        "unresolved_inputs": [],
     }
 
     assert validate_stage_output("GLOBAL_INTERFACE_BINDING", output) == []
@@ -232,27 +237,42 @@ def test_global_interface_binding_contract_accepts_complete_output():
 
 def test_global_interface_binding_contract_rejects_invalid_relation():
     output = {
-        "bindings": [
+        "artifact_groups": [
             {
-                "producer_tool": "read_items",
-                "producer_field": "$response",
-                "producer_member": "",
-                "consumer_tool": "apply_item",
-                "consumer_field": "item_id",
-                "canonical_artifact": "item_identifier",
-                "relation": "guess",
-                "support": "weak",
-                "evidence": "",
+                "canonical_name": "item_identifier",
+                "flows": [
+                    {
+                        "producer": {
+                            "tool": "read_items",
+                            "field": "$response",
+                            "member": "",
+                        },
+                        "consumer": {"tool": "apply_item", "field": "item_id"},
+                        "support": "weak",
+                        "evidence": "",
+                    }
+                ],
             }
         ],
         "state_preconditions": [],
+        "unresolved_inputs": [
+            {
+                "tool": "apply_item",
+                "field": "item_id",
+                "resolution": "guess",
+                "evidence": "",
+            }
+        ],
     }
 
     errors = validate_stage_output("GLOBAL_INTERFACE_BINDING", output)
 
-    assert "$.bindings[0].relation has an invalid value" in errors
-    assert "$.bindings[0].support has an invalid value" in errors
-    assert "$.bindings[0].evidence must be a non-empty string" in errors
+    flow = "$.artifact_groups[0].flows[0]"
+    assert f"{flow}.producer.member must name the response member" in errors
+    assert f"{flow}.support has an invalid value" in errors
+    assert f"{flow}.evidence must be a non-empty string" in errors
+    assert "$.unresolved_inputs[0].resolution has an invalid value" in errors
+    assert "$.unresolved_inputs[0].evidence must be a non-empty string" in errors
 
 
 def test_role_loader_preserves_exact_model_identifier():

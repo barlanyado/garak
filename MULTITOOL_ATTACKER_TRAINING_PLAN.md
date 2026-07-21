@@ -138,15 +138,15 @@ measured 5+5 campaign episode was consumed.
 The redesigned flow is:
 
 ```text
-DEEP_RECON(tool), in bounded parallel where safe
+DEEP_RECON(tool), victim then parser, sequential per tool
   -> TOOL_INTERFACE_TAGGING(tool), in bounded parallel
   -> NORMALIZE_TAGS(all compact records), deterministic code
-  -> BUILD_DEPENDENCY_GRAPH, deterministic code
-  -> EDGE_SCORE(candidate pairs), parallel batches where useful
+  -> GLOBAL_INTERFACE_BINDING(all compact interfaces), one sequential LLM call
+  -> VALIDATE_GLOBAL_ARTIFACTS, deterministic code
   -> SELECT_DEPENDENCY_SUBGRAPHS, deterministic code
   -> PATH_ANALYSIS(selected subgraph), parallel across independent paths
-  -> EXPLOIT_HYPOTHESES(path analysis), parallel across independent paths
-  -> STEP_PLAN(one hypothesis), parallel across independent hypotheses
+  -> EXPLOIT_HYPOTHESES(path analysis)
+  -> STEP_PLAN(one hypothesis)
   -> STEP_ATTACK / STEP_EXPLOIT, sequential inside each stateful chain
   -> GPT-5.2 semantic judging, after the corresponding victim response
   -> deterministic outcome validation and offline export
@@ -157,10 +157,10 @@ validators, serializers, downstream consumers, trace joins, exporter rendering,
 tests and documentation in the same change. A stage is not complete while any
 downstream consumer still expects its old fields or semantics.
 
-The future attacker-model stages are:
+The current attacker-model stages are:
 
 1. `TOOL_INTERFACE_TAGGING`
-2. `EDGE_SCORE`
+2. `GLOBAL_INTERFACE_BINDING`
 3. `PATH_ANALYSIS`
 4. `EXPLOIT_HYPOTHESES`
 5. `STEP_PLAN`
@@ -183,7 +183,7 @@ response; model-generated labels are never authoritative identifiers.
   grounded on only that subgraph's contracts, observed behaviour, artifact
   flows and terminal action.
 - Every security claim is labelled `documented`, `observed`, `hypothesis` or
-  `unsupported`, with evidence and confidence.
+  `unsupported`, with evidence.
 - Generic prompts use artifacts, bindings, prerequisites, sources, sinks and
   side effects. They must not contain code-review-, ecommerce-, support- or
   other victim-specific tool names, values or attack recipes.
@@ -208,13 +208,14 @@ It deliberately omits ``is_source``, ``is_sink``, ``sink_severity``,
 ``high_impact_action`` and ``impact_severity``. Pre-v2 records remain accepted
 only by the compatibility normalizer; strict model-only runs require v2.
 
-### Deterministic normalisation and dependency-aware planning
+### Global normalisation and dependency-aware planning
 
-Normalisation first matches exact declared producer/consumer fields and types.
-It may then assign a generic controlled category while preserving the original
-field, evidence and binding. Ambiguous mappings remain unresolved and go to
-edge scoring; code never invents a capability or silently aliases two runtime
-tools. Similar tool names remain distinct nodes.
+One global attacker call receives all compact tool interfaces and returns every
+supported artifact flow, state precondition and unresolved input. It includes
+same-name fields instead of receiving a deterministic exact-edge answer to copy.
+Code preserves exact runtime identifiers, rejects invented fields, derives
+``exact``, ``semantic_alias`` and ``response_member`` from endpoints, and marks
+incomplete model maps in the trace. Similar tool names remain distinct nodes.
 
 Selected attacks are dependency subgraphs rather than arbitrary total-order
 lists. Independent prerequisites may appear in any valid topological order.
@@ -680,6 +681,7 @@ bounded GPU-memory allocation. Because `gracious_booth` was started with
 | 2026-07-19 | DGX deployment | Recreated the safe codereview stack and fixed Docker 28 loopback ingress plus async proxy use | No long-lived checkout was changed; only isolated worktrees/images/containers were used |
 | 2026-07-19 | Hosted experiments | Completed strict and fallback campaigns, generated reports and retained the rejected first smoke separately | No source changed during the frozen campaigns |
 | 2026-07-21 | `garak` | Follow-up after v2 validation: deterministic exact bindings, filtered ambiguous edge scoring, cross-tool control reconciliation, contract-complete path ranking, active state-prerequisite completion and exact visible artifact repair | Yes; existing contributor probe logic, tests and probe documentation were changed |
+| 2026-07-21 | `garak` | Replaced delta-style global binding with one complete global artifact-normalization output; code now validates runtime endpoints, derives relation types and records completeness gaps | Yes; only the chain probe, its stage contract, prompts, tests and documentation were changed; the shared single-tool probe was not changed |
 
 ## Interface v2 follow-up validation
 
@@ -747,24 +749,31 @@ No retry or additional episode was run. The next review should decide how to
 stop safely when a victim over-executes later tools during an earlier step,
 without trusting self-reported terminal prose or querying hidden backend state.
 
-## Global interface-binding follow-up
+## Global artifact-normalization follow-up
 
-The next approved probe revision replaces measured ``EDGE_SCORE`` calls with
-one ``GLOBAL_INTERFACE_BINDING`` stage after all per-tool v2 tags are available.
-Exact same-name output/input bindings remain deterministic. The global model
-receives compact interfaces, exact bindings, unresolved inputs, declared tool
-contracts and bounded observed behaviour. It may return only evidence-grounded
-``response_member`` bindings, differently named ``semantic_alias`` bindings,
-and documented or observed state preconditions. Code validates exact runtime
-tool and field names, rejects invented relations, and derives the graph used by
-path search. Canonical artifact names never replace runtime arguments.
+The measured probe uses one ``GLOBAL_INTERFACE_BINDING`` attacker call after all
+per-tool v2 tags are available. Its revised contract is a complete global
+artifact-normalization map, not a delta over code-generated exact bindings. The
+model receives every compact interface, declared tool contract and bounded
+observed behaviour, but no prebuilt edge list. It returns artifact groups
+containing all supported exact, renamed-field and ``$response``-member flows;
+documented or observed state preconditions; and one resolution for every input
+without a producer.
+
+The model does not label relation types or choose an attack path. Code validates
+exact runtime tool and field names, rejects invented relations, derives
+``exact``, ``semantic_alias`` and ``response_member`` from the endpoints, and
+then performs deterministic path search. Omitted exact flows are added for safe
+execution while the normalization event marks the model output incomplete.
+Canonical artifact names never replace runtime arguments.
 
 The graph contract also drives the step plan and extraction: a bound member such
 as ``$response.number`` is extracted from visible output under ``number`` and is
 then supplied to the exact consumer argument named by the binding. Stage traces
 retain the raw global output; episode traces retain every accepted and rejected
-relation. Per-tool tagging and independent path analysis remain parallel within
-``max_parallel_stage_requests``. Global binding and victim execution are
+relation, unresolved input, missing exact flow and missing input resolution.
+Per-tool tagging and independent path analysis remain parallel within
+``max_parallel_stage_requests``. Global normalization and victim execution are
 sequential because they depend on complete upstream state.
 
 The validation gate is exactly one fresh hosted Nano episode with GPT-5.2 as

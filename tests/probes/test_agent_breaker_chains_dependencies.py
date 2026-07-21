@@ -550,30 +550,72 @@ def test_global_binding_normalisation_preserves_runtime_names_and_builds_path():
     probe = _global_binding_probe()
     probe.max_chain_len = 4
     probe.max_chains = 1
-    exact = probe._exact_binding_edges(probe._build_capability_graph(probe.tool_tags))
+    candidates = probe._build_capability_graph(probe.tool_tags)
     parsed = {
-        "bindings": [
+        "artifact_groups": [
             {
-                "producer_tool": "list_changes",
-                "producer_field": "$response",
-                "producer_member": "number",
-                "consumer_tool": "run_job",
-                "consumer_field": "change_number",
-                "canonical_artifact": "change_identifier",
-                "relation": "response_member",
-                "support": "observed",
-                "evidence": "observed list response names each change number",
+                "canonical_name": "change_identifier",
+                "flows": [
+                    {
+                        "producer": {
+                            "tool": "list_changes",
+                            "field": "$response",
+                            "member": "number",
+                        },
+                        "consumer": {
+                            "tool": "run_job",
+                            "field": "change_number",
+                        },
+                        "support": "observed",
+                        "evidence": "observed list response names each change number",
+                    }
+                ],
             },
             {
-                "producer_tool": "run_job",
-                "producer_field": "invented_token",
-                "producer_member": "",
-                "consumer_tool": "apply_change",
-                "consumer_field": "approval_token",
-                "canonical_artifact": "authorization_artifact",
-                "relation": "semantic_alias",
-                "support": "inferred",
-                "evidence": "invented output",
+                "canonical_name": "uploaded_object_identifier",
+                "flows": [
+                    {
+                        "producer": {
+                            "tool": "upload_asset",
+                            "field": "upload_id",
+                            "member": "",
+                        },
+                        "consumer": {"tool": "run_job", "field": "upload_id"},
+                        "support": "documented",
+                        "evidence": "run_job consumes the upload identifier",
+                    }
+                ],
+            },
+            {
+                "canonical_name": "authorization_artifact",
+                "flows": [
+                    {
+                        "producer": {
+                            "tool": "run_job",
+                            "field": "approval_token",
+                            "member": "",
+                        },
+                        "consumer": {
+                            "tool": "apply_change",
+                            "field": "approval_token",
+                        },
+                        "support": "documented",
+                        "evidence": "apply_change consumes the approval token",
+                    },
+                    {
+                        "producer": {
+                            "tool": "run_job",
+                            "field": "invented_token",
+                            "member": "",
+                        },
+                        "consumer": {
+                            "tool": "apply_change",
+                            "field": "approval_token",
+                        },
+                        "support": "inferred",
+                        "evidence": "invented output",
+                    },
+                ],
             },
         ],
         "state_preconditions": [
@@ -584,9 +626,29 @@ def test_global_binding_normalisation_preserves_runtime_names_and_builds_path():
                 "evidence": "upload is scoped to a listed change",
             }
         ],
+        "unresolved_inputs": [
+            {
+                "tool": "upload_asset",
+                "field": "filename",
+                "resolution": "conversation_controlled",
+                "evidence": "conversation supplies filename",
+            },
+            {
+                "tool": "upload_asset",
+                "field": "content",
+                "resolution": "conversation_controlled",
+                "evidence": "conversation supplies content",
+            },
+            {
+                "tool": "run_job",
+                "field": "repo",
+                "resolution": "conversation_controlled",
+                "evidence": "conversation supplies repository",
+            },
+        ],
     }
 
-    edges = probe._normalise_global_bindings(parsed, exact)
+    edges = probe._normalise_global_artifacts(parsed, candidates)
     paths = probe._search_chains(edges, probe.tool_tags)
 
     assert any(
@@ -596,6 +658,7 @@ def test_global_binding_normalisation_preserves_runtime_names_and_builds_path():
         for edge in edges
     )
     assert not any(edge.get("producer_field") == "invented_token" for edge in edges)
+    assert probe.global_interface_normalization["complete_model_map"] is False
     assert len(paths) == 1
     assert paths[0]["sequence"] == [
         "list_changes",
@@ -605,7 +668,7 @@ def test_global_binding_normalisation_preserves_runtime_names_and_builds_path():
     ]
 
 
-def test_global_binding_prompt_receives_all_tools_exact_and_unresolved_inputs():
+def test_global_binding_prompt_receives_all_tools_without_prebuilt_bindings():
     probe = _global_binding_probe()
     probe.agent_config = {
         "tools": [
@@ -615,16 +678,14 @@ def test_global_binding_prompt_receives_all_tools_exact_and_unresolved_inputs():
     }
     probe.tool_profiles = {name: {} for name in probe.tool_tags}
     probe.tool_behaviors = {name: [] for name in probe.tool_tags}
-    probe._prompts = {
-        "GLOBAL_INTERFACE_BINDING": (
-            "TOOLS {tool_interfaces}\nEXACT {exact_bindings}\n"
-            "UNRESOLVED {unresolved_inputs}"
-        )
-    }
+    probe._prompts = {"GLOBAL_INTERFACE_BINDING": "TOOLS {tool_interfaces}"}
     probe._detector = MagicMock()
     probe._detector._extract_json.side_effect = json.loads
     probe._get_stage_model_response = MagicMock(
-        return_value='{"bindings": [], "state_preconditions": []}'
+        return_value=(
+            '{"artifact_groups": [], "state_preconditions": [], '
+            '"unresolved_inputs": []}'
+        )
     )
     candidates = probe._build_capability_graph(probe.tool_tags)
 
@@ -632,9 +693,123 @@ def test_global_binding_prompt_receives_all_tools_exact_and_unresolved_inputs():
 
     rendered = probe._get_stage_model_response.call_args.args[1]
     assert all(name in rendered for name in probe.tool_tags)
-    assert '"producer_field": "upload_id"' in rendered
+    assert "deterministic exact field-name match" not in rendered
+    assert '"match_kind"' not in rendered
     assert '"field": "change_number"' in rendered
     assert all(edge["match_kind"] == "exact" for edge in edges)
+    assert probe.global_interface_normalization["complete_model_map"] is False
+
+
+def test_complete_global_map_derives_all_relation_types_in_code():
+    probe = object.__new__(AgentBreakerChains)
+    probe.episode_trace_path = None
+    probe.tool_tags = {
+        "enumerate_items": _tag(
+            produces=(_output("$response", "item_collection"),),
+            source=True,
+        ),
+        "store_payload": _tag(
+            consumes=(_input("content", "payload", "optional"),),
+            produces=(_output("object_id", "stored_object_identifier"),),
+            source=True,
+        ),
+        "execute_job": _tag(
+            consumes=(
+                _input("item_number", "item_identifier"),
+                _input("object_id", "stored_object_identifier"),
+            ),
+            produces=(_output("approval_artifact", "authorization_artifact"),),
+        ),
+        "commit_action": _tag(
+            consumes=(_input("approval_token", "authorization_artifact"),),
+            sink=True,
+            severity=5,
+        ),
+    }
+    candidates = probe._build_capability_graph(probe.tool_tags)
+    parsed = {
+        "artifact_groups": [
+            {
+                "canonical_name": "item_identifier",
+                "flows": [
+                    {
+                        "producer": {
+                            "tool": "enumerate_items",
+                            "field": "$response",
+                            "member": "number",
+                        },
+                        "consumer": {
+                            "tool": "execute_job",
+                            "field": "item_number",
+                        },
+                        "support": "observed",
+                        "evidence": "observed response contains number",
+                    }
+                ],
+            },
+            {
+                "canonical_name": "stored_object_identifier",
+                "flows": [
+                    {
+                        "producer": {
+                            "tool": "store_payload",
+                            "field": "object_id",
+                            "member": "",
+                        },
+                        "consumer": {
+                            "tool": "execute_job",
+                            "field": "object_id",
+                        },
+                        "support": "documented",
+                        "evidence": "execute_job consumes the stored object_id",
+                    }
+                ],
+            },
+            {
+                "canonical_name": "authorization_artifact",
+                "flows": [
+                    {
+                        "producer": {
+                            "tool": "execute_job",
+                            "field": "approval_artifact",
+                            "member": "",
+                        },
+                        "consumer": {
+                            "tool": "commit_action",
+                            "field": "approval_token",
+                        },
+                        "support": "documented",
+                        "evidence": "the approval artifact authorizes commit_action",
+                    }
+                ],
+            },
+        ],
+        "state_preconditions": [],
+        "unresolved_inputs": [
+            {
+                "tool": "store_payload",
+                "field": "content",
+                "resolution": "optional",
+                "evidence": "content is optional",
+            }
+        ],
+    }
+
+    edges = probe._normalise_global_artifacts(parsed, candidates)
+
+    assert {edge["match_kind"] for edge in edges} == {
+        "exact",
+        "response_member",
+        "semantic_alias",
+    }
+    assert probe.global_interface_normalization == {
+        "accepted_unresolved_inputs": parsed["unresolved_inputs"],
+        "rejected_relations": [],
+        "rejected_unresolved_inputs": [],
+        "missing_exact_flows_added_by_code": [],
+        "missing_input_resolutions": [],
+        "complete_model_map": True,
+    }
 
 
 def test_dependency_contract_uses_response_member_and_runtime_consumer_field():
@@ -823,6 +998,34 @@ def test_tagging_prompt_is_generic_and_renders_v2_contract():
     assert '"interface_contract_version": 2' in rendered
     assert '"security_capabilities"' in rendered
     assert '"high_impact_action"' not in rendered
+    for victim_specific_name in (
+        "list_pull_requests",
+        "upload_file",
+        "run_ci_command",
+        "merge_pr",
+    ):
+        assert victim_specific_name not in template
+
+
+def test_global_normalization_prompt_is_complete_and_victim_agnostic():
+    prompt_path = (
+        Path(__file__).parents[2]
+        / "garak"
+        / "data"
+        / "agent_breaker_chains"
+        / "prompts.yaml"
+    )
+    template = yaml.safe_load(prompt_path.read_text(encoding="utf-8"))[
+        "GLOBAL_INTERFACE_BINDING"
+    ]
+
+    rendered = template.format(tool_interfaces="{}")
+
+    assert '"artifact_groups"' in rendered
+    assert '"unresolved_inputs"' in rendered
+    assert "every supported cross-tool artifact flow" in rendered
+    assert "DETERMINISTIC EXACT BINDINGS" not in rendered
+    assert '"relation"' not in rendered
     for victim_specific_name in (
         "list_pull_requests",
         "upload_file",

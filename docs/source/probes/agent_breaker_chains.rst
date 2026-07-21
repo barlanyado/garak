@@ -47,16 +47,22 @@ its original ``ANALYSIS`` behaviour.
 After all tools are tagged, code reconciles direct-control claims across the
 complete interface set. A required input with an exact field issued by another
 tool is not treated as directly conversation-controlled, even when an isolated
-tagging response claimed otherwise. Exact producer/consumer field matches are
-accepted deterministically with confidence 1.0. One
-``GLOBAL_INTERFACE_BINDING`` call then sees all compact interfaces, exact
-bindings, unresolved inputs, declared contracts and bounded recon evidence. It
-may add a named member of ``$response``, a differently named field with the same
-documented meaning, or an explicitly supported state precondition. Code rejects
-invented tool and field names, invalid relation types and unsupported state
-ordering before path search. Canonical artifact names are internal labels only;
-runtime tool and field names remain authoritative. Accepted and rejected
-relations are retained in a ``GLOBAL_INTERFACE_BINDING_NORMALIZATION`` event.
+tagging response claimed otherwise. One ``GLOBAL_INTERFACE_BINDING`` call then
+sees every compact interface, declared contract and bounded recon observation.
+It returns the complete artifact map: exact same-name flows, renamed fields,
+named members of ``$response``, explicit state preconditions, and one resolution
+for every input without a producer. It does not receive a prebuilt exact-binding
+list and does not select paths or relation labels.
+
+Code checks every returned runtime tool and field against the tagged interfaces,
+rejects invented names and unsupported state ordering, and derives ``exact``,
+``semantic_alias`` or ``response_member`` from the returned endpoints. Exact
+flows receive confidence 1.0; other flows receive confidence from their evidence
+class. Missing exact flows are added deterministically so execution remains
+safe, but the retained ``GLOBAL_ARTIFACT_NORMALIZATION`` event marks the model
+map incomplete. The event also retains accepted and rejected flows, unresolved
+inputs and completeness gaps. Canonical artifact names remain internal labels;
+runtime tool and field names remain authoritative.
 
 The previous ``EDGE_SCORE`` prompt and normaliser remain registered for callers
 that replay older traces, but measured stage routes no longer invoke them.
@@ -71,8 +77,8 @@ override malformed parser placeholders; this includes Markdown-formatted field
 labels.
 
 ``max_parallel_stage_requests`` bounds independent interface-tagging and path-
-analysis calls. The single global-binding call runs after all parallel tags are
-available; stateful target execution remains sequential.
+analysis calls. The single global-normalization call runs after all parallel
+tags are available; stateful target execution remains sequential.
 
 ``stage_model_roles`` maps a role name to ``model_type``, ``model_name``, and
 ``model_config``. ``stage_model_routes`` maps each exact stage name to a role.

@@ -277,38 +277,60 @@ def validate_stage_output(stage: str, parsed: object) -> list[str]:
             if forbidden in item:
                 errors.append(f"$.{forbidden} is not part of interface contract v2")
     elif stage == "GLOBAL_INTERFACE_BINDING":
-        bindings = _require_list(root.get("bindings"), "$.bindings", errors)
-        for index, binding in enumerate(bindings):
-            item = _require_mapping(binding, f"$.bindings[{index}]", errors)
-            for key in (
-                "producer_tool",
-                "producer_field",
-                "producer_member",
-                "consumer_tool",
-                "consumer_field",
-                "canonical_artifact",
-                "relation",
-                "support",
-                "evidence",
-            ):
-                value = item.get(key)
-                if not isinstance(value, str):
-                    errors.append(f"$.bindings[{index}].{key} must be a string")
-                elif key != "producer_member" and not value.strip():
-                    errors.append(
-                        f"$.bindings[{index}].{key} must be a non-empty string"
-                    )
-            if item.get("relation") not in {"response_member", "semantic_alias"}:
-                errors.append(f"$.bindings[{index}].relation has an invalid value")
-            if item.get("support") not in {"documented", "observed", "inferred"}:
-                errors.append(f"$.bindings[{index}].support has an invalid value")
-            if (
-                item.get("relation") == "response_member"
-                and not str(item.get("producer_member") or "").strip()
-            ):
-                errors.append(
-                    f"$.bindings[{index}].producer_member must name the response member"
+        groups = _require_list(
+            root.get("artifact_groups"), "$.artifact_groups", errors
+        )
+        for group_index, group in enumerate(groups):
+            group_path = f"$.artifact_groups[{group_index}]"
+            group_item = _require_mapping(group, group_path, errors)
+            canonical_name = group_item.get("canonical_name")
+            if not isinstance(canonical_name, str) or not canonical_name.strip():
+                errors.append(f"{group_path}.canonical_name must be a non-empty string")
+            flows = _require_list(
+                group_item.get("flows"), f"{group_path}.flows", errors
+            )
+            if not flows:
+                errors.append(f"{group_path}.flows must contain at least one flow")
+            for flow_index, flow in enumerate(flows):
+                flow_path = f"{group_path}.flows[{flow_index}]"
+                item = _require_mapping(flow, flow_path, errors)
+                producer = _require_mapping(
+                    item.get("producer"), f"{flow_path}.producer", errors
                 )
+                consumer = _require_mapping(
+                    item.get("consumer"), f"{flow_path}.consumer", errors
+                )
+                for key in ("tool", "field"):
+                    value = producer.get(key)
+                    if not isinstance(value, str) or not value.strip():
+                        errors.append(
+                            f"{flow_path}.producer.{key} must be a non-empty string"
+                        )
+                    value = consumer.get(key)
+                    if not isinstance(value, str) or not value.strip():
+                        errors.append(
+                            f"{flow_path}.consumer.{key} must be a non-empty string"
+                        )
+                member = producer.get("member")
+                if not isinstance(member, str):
+                    errors.append(f"{flow_path}.producer.member must be a string")
+                elif producer.get("field") == "$response" and not member.strip():
+                    errors.append(
+                        f"{flow_path}.producer.member must name the response member"
+                    )
+                elif producer.get("field") != "$response" and member.strip():
+                    errors.append(
+                        f"{flow_path}.producer.member is allowed only for $response"
+                    )
+                if item.get("support") not in {
+                    "documented",
+                    "observed",
+                    "inferred",
+                }:
+                    errors.append(f"{flow_path}.support has an invalid value")
+                evidence = item.get("evidence")
+                if not isinstance(evidence, str) or not evidence.strip():
+                    errors.append(f"{flow_path}.evidence must be a non-empty string")
 
         preconditions = _require_list(
             root.get("state_preconditions"), "$.state_preconditions", errors
@@ -321,12 +343,38 @@ def validate_stage_output(stage: str, parsed: object) -> list[str]:
                 value = item.get(key)
                 if not isinstance(value, str) or not value.strip():
                     errors.append(
-                        f"$.state_preconditions[{index}].{key} must be a non-empty string"
+                        f"$.state_preconditions[{index}].{key} must be a "
+                        "non-empty string"
                     )
             if item.get("support") not in {"documented", "observed"}:
                 errors.append(
                     f"$.state_preconditions[{index}].support has an invalid value"
                 )
+        unresolved = _require_list(
+            root.get("unresolved_inputs"), "$.unresolved_inputs", errors
+        )
+        for index, unresolved_input in enumerate(unresolved):
+            item = _require_mapping(
+                unresolved_input, f"$.unresolved_inputs[{index}]", errors
+            )
+            for key in ("tool", "field", "evidence"):
+                value = item.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(
+                        f"$.unresolved_inputs[{index}].{key} must be a non-empty string"
+                    )
+            if item.get("resolution") not in {
+                "conversation_controlled",
+                "optional",
+                "unknown",
+            }:
+                errors.append(
+                    f"$.unresolved_inputs[{index}].resolution has an invalid value"
+                )
+        if "bindings" in root:
+            errors.append(
+                "$.bindings is not part of the complete normalization contract"
+            )
     elif stage == "EDGE_SCORE":
         edges = _require_list(root.get("edges"), "$.edges", errors)
         for index, edge in enumerate(edges):

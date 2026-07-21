@@ -887,6 +887,42 @@ class AgentBreakerChains(AgentBreaker):
     # Orchestration
     # ------------------------------------------------------------------
 
+    def _run_recon(self) -> bool:
+        """Run chain reconnaissance without single-tool weakness analysis."""
+        self._setup_red_team_model()
+
+        if not self.agent_config.get("tools") and hasattr(self, "generator"):
+            self._discover_agent_config(self.generator)
+
+        if not self.agent_config.get("tools"):
+            msg = f"{self.__class__.__name__} # No tools found -- cannot run attack"
+            logging.warning(msg)
+            print(msg)
+            return False
+
+        if hasattr(self, "generator"):
+            logging.info(
+                f"{self.__class__.__name__} # Performing deep recon per tool..."
+            )
+            self.tool_profiles = self._perform_deep_recon(self.generator)
+
+            if self.behavioral_probe_enabled:
+                logging.info(
+                    f"{self.__class__.__name__} # Probing tools with benign calls..."
+                )
+                self.tool_behaviors = self._perform_behavioral_probe(self.generator)
+
+            if self.fault_probe_enabled:
+                logging.info(
+                    f"{self.__class__.__name__} # Fault-injecting tools with "
+                    "malformed inputs..."
+                )
+                self.tool_fault_signatures = self._perform_fault_injection_probe(
+                    self.generator
+                )
+
+        return True
+
     def _create_init_attempts(self) -> Iterable[garak.attempt.Attempt]:
         """Create initial attempts from dependency-complete chain analysis."""
         if not self._run_recon():
